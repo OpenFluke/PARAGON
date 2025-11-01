@@ -27,6 +27,13 @@ type Grid[T Numeric] struct {
 
 	CachedOutputs        []T   // used for entropy-based replay gating
 	CachedOutputsHistory [][]T // History of activations for temporal replay (3 passes)
+
+	SliceTypes []string
+	// Attention config + params
+	Attn       *AttnConfig[T]         // nil ⇒ no attention configured
+	attnLayer  *AttnParams[T]         // shared across attn columns if Share="layer"
+	attnSlices map[int]*AttnParams[T] // per-column params if Share="per-slice"
+
 }
 
 // Neuron represents a single unit in the grid
@@ -126,10 +133,16 @@ func NewNetwork[T Numeric](
 	idCounter := 0
 	for i, size := range layerSizes {
 		grid := Grid[T]{
-			Width:   size.Width,
-			Height:  size.Height,
-			Neurons: make([][]*Neuron[T], size.Height),
+			Width:      size.Width,
+			Height:     size.Height,
+			Neurons:    make([][]*Neuron[T], size.Height),
+			SliceTypes: make([]string, size.Width),
 		}
+
+		for x := 0; x < size.Width; x++ {
+			grid.SliceTypes[x] = "dense"
+		}
+
 		for y := 0; y < size.Height; y++ {
 			grid.Neurons[y] = make([]*Neuron[T], size.Width)
 			for x := 0; x < size.Width; x++ {
@@ -148,6 +161,14 @@ func NewNetwork[T Numeric](
 
 	n.ConnectLayers(fullyConnected)
 	return n, nil
+}
+
+func (n *Network[T]) SetSliceTypes(layerIdx int, types []string) {
+	g := &n.Layers[layerIdx]
+	if len(types) != g.Width {
+		panic("SetSliceTypes: len(types) must equal layer width")
+	}
+	copy(g.SliceTypes, types)
 }
 
 // -----------------------------------------------------------------------------
@@ -303,18 +324,29 @@ func (n *Network[T]) forwardLayer(l int, isReplay bool) {
 	curr := n.Layers[l]
 	for y := 0; y < curr.Height; y++ {
 		for x := 0; x < curr.Width; x++ {
-			neuron := curr.Neurons[y][x]
-			sum := neuron.Bias
-			for _, c := range neuron.Inputs {
-				src := n.Layers[c.SourceLayer].Neurons[c.SourceY][c.SourceX]
-				sum += src.Value * c.Weight
+			kind := "dense"
+			if curr.SliceTypes != nil && x < len(curr.SliceTypes) && curr.SliceTypes[x] != "" {
+				kind = curr.SliceTypes[x]
 			}
-			value := ApplyActivationGeneric(sum, neuron.Activation)
-			if isReplay {
-				// Apply a scaling factor during replay to alter the output
-				value = T(float64(value) * 1.1)
+
+			switch kind {
+			case "attn":
+				n.forwardAttnColumn(l, x, isReplay)
+			default:
+				neuron := curr.Neurons[y][x]
+				sum := neuron.Bias
+				for _, c := range neuron.Inputs {
+					src := n.Layers[c.SourceLayer].Neurons[c.SourceY][c.SourceX]
+					sum += src.Value * c.Weight
+				}
+				value := ApplyActivationGeneric(sum, neuron.Activation)
+				if isReplay {
+					// Apply a scaling factor during replay to alter the output
+					value = T(float64(value) * 1.1)
+				}
+				neuron.Value = value
 			}
-			neuron.Value = value
+
 		}
 	}
 }
