@@ -8,9 +8,9 @@ import (
 	"fmt"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Wire types (JSON schema)
-// ─────────────────────────────────────────────────────────────────────────────
+/* =============================================================================
+   Wire types (JSON schema)
+   ========================================================================== */
 
 // Whole file format (can hold multiple models)
 type Bundle struct {
@@ -32,16 +32,21 @@ type ModelCfg struct {
 	Layers       []LayerCfg `json:"layers"`
 	Activations  []string   `json:"activations"`
 	Seed         *int64     `json:"seed,omitempty"`
-	Connectivity []bool     `json:"connectivity,omitempty"` // optional: mirrors your NewNetwork arg
+	Connectivity []bool     `json:"connectivity,omitempty"`
 }
 
 type LayerCfg struct {
-	Width       int          `json:"Width"`
-	Height      int          `json:"Height"`
-	Slices      []string     `json:"slices,omitempty"` // per-column: "dense","attn",...
-	Attn        *AttnCfgWire `json:"attn,omitempty"`   // attention knobs (wire version)
-	Replay      *ReplayCfg   `json:"replay,omitempty"` // optional: persist replay knobs
-	Description string       `json:"description,omitempty"`
+	Width  int          `json:"Width"`
+	Height int          `json:"Height"`
+	Slices []string     `json:"slices,omitempty"` // per-column: "dense","attn",...
+	Attn   *AttnCfgWire `json:"attn,omitempty"`   // attention knobs (wire version)
+
+	// Persisted attention params (prevents lazy re-init on load)
+	AttnParams         *AttnParamsWire         `json:"attn_params,omitempty"`           // when Share == "layer"
+	AttnParamsPerSlice map[int]*AttnParamsWire `json:"attn_params_per_slice,omitempty"` // when Share == "per-slice"`
+
+	Replay      *ReplayCfg `json:"replay,omitempty"`
+	Description string     `json:"description,omitempty"`
 }
 
 type AttnCfgWire struct {
@@ -50,6 +55,15 @@ type AttnCfgWire struct {
 	Share    string  `json:"share"`    // "layer" | "per-slice"
 	Dropout  float32 `json:"dropout"`  // training only
 	PosEnc2D bool    `json:"posEnc2D"` // spatial awareness
+}
+
+// Learned attention parameter payload
+type AttnParamsWire struct {
+	Wq []float64 `json:"wq"`           // len = dk
+	Wk []float64 `json:"wk"`           // len = dk
+	Wv []float64 `json:"wv"`           // len = dk
+	Wo []float64 `json:"wo,omitempty"` // len = dk * Hcurr (only when UseWo)
+	DK int       `json:"dk"`
 }
 
 type ReplayCfg struct {
@@ -66,25 +80,15 @@ type Weights struct {
 	Data string `json:"data"` // base64(JSON(sNet))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-/*
+/* =============================================================================
    Public API (string-in / string-out)
-
-   - ExportBundleJSON: take a Network[T] → single-model bundle JSON string.
-   - ImportBundleJSON: parse bundle JSON string → build a typed network (any).
-
-   - PackModel: produce (Cfg + Weights) for one network.
-   - UnpackModel: build a typed network from (Cfg + Weights), apply cfg slices/attn.
-
-   Notes:
-   * We reuse your existing (n.MarshalJSONModel / n.Unmarshal) for weights.
-   * The cfg carries modern knobs (slices/attn/replay) that your old weight JSON
-     doesn’t know about; after we load weights we apply the cfg on top.
-*/
-// ─────────────────────────────────────────────────────────────────────────────
+   ========================================================================== */
 
 // Export one model to a bundle JSON (single-entry Models).
 func ExportBundleJSON[T Numeric](id string, n *Network[T], seed *int64) (string, error) {
+	// Ensure attention params exist before packing, so they get persisted.
+	ensureAttnMaterialized(n)
+
 	m, err := PackModel(id, n, seed)
 	if err != nil {
 		return "", err
@@ -117,14 +121,14 @@ func ImportBundleJSON(bundleJSON string) (any, error) {
 	return UnpackModel(bun.Models[0])
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pack / Unpack a single model
-// ─────────────────────────────────────────────────────────────────────────────
+/* =============================================================================
+   Pack / Unpack a single model
+   ========================================================================== */
 
 func PackModel[T Numeric](id string, n *Network[T], seed *int64) (BundleModel, error) {
 	cfg := modelCfgFromNetwork(id, n, seed)
 
-	raw, err := n.MarshalJSONModel() // your existing sNet JSON (with weights + topology)
+	raw, err := n.MarshalJSONModel() // existing sNet JSON (weights + topology)
 	if err != nil {
 		return BundleModel{}, err
 	}
@@ -135,7 +139,7 @@ func PackModel[T Numeric](id string, n *Network[T], seed *int64) (BundleModel, e
 	return BundleModel{ID: id, Cfg: cfg, Weights: w}, nil
 }
 
-// Build a typed network from weights, then apply cfg (slices/attn/replay).
+// Build a typed network from weights, then apply cfg (slices/attn/replay + attn params).
 func UnpackModel(m BundleModel) (any, error) {
 	if m.Weights.Fmt != "jsonModelB64" {
 		return nil, fmt.Errorf("unsupported weights fmt: %s", m.Weights.Fmt)
@@ -151,7 +155,7 @@ func UnpackModel(m BundleModel) (any, error) {
 		return nil, fmt.Errorf("load weighted model: %w", err)
 	}
 
-	// Apply the cfg’s modern knobs (slices/attn/replay) on top of loaded weights.
+	// Apply cfg knobs and persisted attention params.
 	switch n := nAny.(type) {
 	case *Network[float32]:
 		if err := applyCfgToNetwork(n, m.Cfg); err != nil {
@@ -182,17 +186,15 @@ func UnpackModel(m BundleModel) (any, error) {
 			return nil, err
 		}
 	case *Network[uint], *Network[uint8], *Network[uint16], *Network[uint32], *Network[uint64]:
-		// If you truly need uint nets, add explicit cases as above.
-		// Keeping generic for brevity (same apply function signature).
-		// Fallthrough is fine if you add those specializations.
+		// add explicit cases if you actually use uint nets
 	}
 
 	return nAny, nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal: build ModelCfg from a live Network[T]
-// ─────────────────────────────────────────────────────────────────────────────
+/* =============================================================================
+   Internal: build ModelCfg from a live Network[T]
+   ========================================================================== */
 
 func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) ModelCfg {
 	cfg := ModelCfg{
@@ -206,12 +208,13 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 			Width:  g.Width,
 			Height: g.Height,
 		}
+		// Slices
 		if len(g.SliceTypes) == g.Width {
 			cp := make([]string, len(g.SliceTypes))
 			copy(cp, g.SliceTypes)
 			lc.Slices = cp
 		}
-		// Attention knobs (if present)
+		// Attention knobs + PARAMS (persist)
 		if g.Attn != nil {
 			lc.Attn = &AttnCfgWire{
 				DK:       g.Attn.DK,
@@ -219,6 +222,34 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 				Share:    g.Attn.Share,
 				Dropout:  g.Attn.Dropout,
 				PosEnc2D: g.Attn.PosEnc2D,
+			}
+			switch g.Attn.Share {
+			case "layer":
+				if g.attnLayer != nil {
+					lc.AttnParams = &AttnParamsWire{
+						DK: g.attnLayer.DK,
+						Wq: tVecToF64(g.attnLayer.Wq),
+						Wk: tVecToF64(g.attnLayer.Wk),
+						Wv: tVecToF64(g.attnLayer.Wv),
+						Wo: tVecToF64(g.attnLayer.Wo),
+					}
+				}
+			case "per-slice":
+				if g.attnSlices != nil && len(g.attnSlices) > 0 {
+					lc.AttnParamsPerSlice = make(map[int]*AttnParamsWire, len(g.attnSlices))
+					for col, p := range g.attnSlices {
+						if p == nil {
+							continue
+						}
+						lc.AttnParamsPerSlice[col] = &AttnParamsWire{
+							DK: p.DK,
+							Wq: tVecToF64(p.Wq),
+							Wk: tVecToF64(p.Wk),
+							Wv: tVecToF64(p.Wv),
+							Wo: tVecToF64(p.Wo),
+						}
+					}
+				}
 			}
 		}
 		// Replay (optional)
@@ -233,7 +264,7 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 		}
 
 		cfg.Layers[i] = lc
-		// capture the layer's default activation (taken from any neuron in the row)
+		// capture the layer's default activation (taken from any neuron)
 		if g.Height > 0 && g.Width > 0 && g.Neurons[0][0] != nil {
 			cfg.Activations[i] = g.Neurons[0][0].Activation
 		}
@@ -241,14 +272,12 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 	return cfg
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal: apply cfg (slices/attn/replay) onto a live Network[T]
-// ─────────────────────────────────────────────────────────────────────────────
+/* =============================================================================
+   Internal: apply cfg (slices/attn/replay + attn params) to a live Network[T]
+   ========================================================================== */
 
 func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 	if len(cfg.Layers) != len(n.Layers) {
-		// We allow weights to define topology, so we don’t rebuild here.
-		// But we do enforce same number of layers for knobs application.
 		return fmt.Errorf("cfg/layer-count mismatch: cfg=%d, net=%d", len(cfg.Layers), len(n.Layers))
 	}
 	for i := range n.Layers {
@@ -260,14 +289,13 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 			if len(cl.Slices) != gl.Width {
 				return fmt.Errorf("cfg slices width mismatch at layer %d: %d != %d", i, len(cl.Slices), gl.Width)
 			}
-			// init SliceTypes if nil
 			if gl.SliceTypes == nil || len(gl.SliceTypes) != gl.Width {
 				gl.SliceTypes = make([]string, gl.Width)
 			}
 			copy(gl.SliceTypes, cl.Slices)
 		}
 
-		// Attention
+		// Attention knobs + PARAMS
 		if cl.Attn != nil {
 			gl.Attn = &AttnConfig[T]{
 				DK:       cl.Attn.DK,
@@ -276,9 +304,49 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 				Dropout:  cl.Attn.Dropout,
 				PosEnc2D: cl.Attn.PosEnc2D,
 			}
-			// clear any lazily-initialized params; they’ll re-init on first forward
-			gl.attnLayer = nil
-			gl.attnSlices = nil
+
+			switch cl.Attn.Share {
+			case "layer":
+				if cl.AttnParams != nil {
+					gl.attnLayer = &AttnParams[T]{
+						DK: cl.AttnParams.DK,
+						Wq: f64VecToT[T](cl.AttnParams.Wq),
+						Wk: f64VecToT[T](cl.AttnParams.Wk),
+						Wv: f64VecToT[T](cl.AttnParams.Wv),
+						Wo: f64VecToT[T](cl.AttnParams.Wo),
+					}
+				} else {
+					gl.attnLayer = nil // allow lazy init if truly absent
+				}
+				gl.attnSlices = nil
+
+			case "per-slice":
+				gl.attnLayer = nil
+				if gl.attnSlices == nil {
+					gl.attnSlices = make(map[int]*AttnParams[T])
+				} else {
+					for k := range gl.attnSlices {
+						delete(gl.attnSlices, k)
+					}
+				}
+				if cl.AttnParamsPerSlice != nil {
+					for col, pw := range cl.AttnParamsPerSlice {
+						if pw == nil {
+							continue
+						}
+						gl.attnSlices[col] = &AttnParams[T]{
+							DK: pw.DK,
+							Wq: f64VecToT[T](pw.Wq),
+							Wk: f64VecToT[T](pw.Wk),
+							Wv: f64VecToT[T](pw.Wv),
+							Wo: f64VecToT[T](pw.Wo),
+						}
+					}
+				}
+			default:
+				gl.attnLayer = nil
+				gl.attnSlices = nil
+			}
 		}
 
 		// Replay
@@ -293,9 +361,9 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 	return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Convenience: pack/unpack weights as raw strings (if you want to store separately)
-// ─────────────────────────────────────────────────────────────────────────────
+/* =============================================================================
+   Convenience: pack/unpack weights as raw strings
+   ========================================================================== */
 
 func PackWeightsJSONB64[T Numeric](n *Network[T]) (string, error) {
 	raw, err := n.MarshalJSONModel()
@@ -311,4 +379,69 @@ func UnpackWeightsJSONB64(weightsB64 string) (any, error) {
 		return nil, err
 	}
 	return LoadNamedNetworkFromJSONString(string(b))
+}
+
+/* =============================================================================
+   Small helpers: []T <-> []float64
+   ========================================================================== */
+
+func tVecToF64[T Numeric](v []T) []float64 {
+	if v == nil {
+		return nil
+	}
+	out := make([]float64, len(v))
+	for i := range v {
+		out[i] = float64(any(v[i]).(T))
+	}
+	return out
+}
+
+func f64VecToT[T Numeric](v []float64) []T {
+	if v == nil {
+		return nil
+	}
+	out := make([]T, len(v))
+	for i := range v {
+		out[i] = T(v[i])
+	}
+	return out
+}
+
+/* =============================================================================
+   NEW: materialize attention params before packing
+   ========================================================================== */
+
+// ensureAttnMaterialized runs a cheap zero-input forward so that any attention
+// params that are lazily initialised become non-nil and can be persisted.
+func ensureAttnMaterialized[T Numeric](n *Network[T]) {
+	need := false
+	for i := range n.Layers {
+		g := &n.Layers[i]
+		if g.Attn == nil {
+			continue
+		}
+		switch g.Attn.Share {
+		case "layer":
+			if g.attnLayer == nil {
+				need = true
+			}
+		case "per-slice":
+			if g.attnSlices == nil || len(g.attnSlices) == 0 {
+				need = true
+			}
+		}
+		if need {
+			break
+		}
+	}
+	if !need {
+		return
+	}
+
+	// Build a zero input (H×W) and do a single forward.
+	inGrid := make([][]float64, n.Layers[n.InputLayer].Height)
+	for y := range inGrid {
+		inGrid[y] = make([]float64, n.Layers[n.InputLayer].Width)
+	}
+	n.Forward(inGrid)
 }
