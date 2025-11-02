@@ -7,33 +7,39 @@ import (
 )
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   Attention config & params
+   Attention config & params (multi-head)
    ───────────────────────────────────────────────────────────────────────────── */
 
 type AttnConfig[T Numeric] struct {
-	DK       int     // head size
-	UseWo    bool    // output projection (dk x Hcurr)
+	// Core
+	Heads    int     // number of heads (defaults to 1 if <=0)
+	DK       int     // per-head size (dk)
+	UseWo    bool    // apply output projection ( (heads*dk) x Hcurr )
 	Share    string  // "layer" | "per-slice"
-	Dropout  float32 // reserved for train-time
+	Dropout  float32 // reserved for train-time (no-op here)
 	PosEnc2D bool    // add tiny 2D positional encoding to tokens
-	UseNorm  bool    // unit-norm zbar before Wo
+	UseNorm  bool    // unit-norm the concatenated zbar (pre-Wo)
 
 	// Tunables (default if zero):
 	PosEncAmp float64 // default 1e-2
 	NormEps   float64 // default 1e-6
 
-	// Replay controls (fully optional):
-	UseReplay   bool    // if true, allow replay gain path
-	ForceReplay bool    // if true, apply replay gain even when caller didn't flag isReplay
+	// Replay controls (optional):
+	UseReplay   bool    // enable replay gain path
+	ForceReplay bool    // force replay gain even if caller isn't in replay
 	ReplayGain  float64 // default 1.1 (only used if UseReplay)
 }
 
 type AttnParams[T Numeric] struct {
-	Wq []T // len=dk
-	Wk []T // len=dk
-	Wv []T // len=dk
-	Wo []T // len=dk*Hcurr (iff UseWo)
-	DK int
+	// Per-head projections; shapes:
+	//  Wq[h],Wk[h],Wv[h] ∈ R^{dk}   (scalar token -> dk)
+	//  Wo ∈ R^{(heads*dk) x Hcurr}  (post-concat projection), if UseWo
+	Wq    [][]T
+	Wk    [][]T
+	Wv    [][]T
+	Wo    []T // len = heads*dk*Hcurr (row-major: outIdx*Hd + t)
+	DK    int
+	Heads int
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +76,13 @@ func defReplayGain[T Numeric](cfg *AttnConfig[T]) float64 {
 		return 1.1
 	}
 	return cfg.ReplayGain
+}
+
+func defHeads[T Numeric](cfg *AttnConfig[T]) int {
+	if cfg == nil || cfg.Heads <= 0 {
+		return 1
+	}
+	return cfg.Heads
 }
 
 func addTinyPosEnc2DWithAmp[T Numeric](x []float64, prev *Grid[T], amp float64) {
@@ -111,22 +124,42 @@ func softmaxRowsInPlace(s [][]float64) {
 	}
 }
 
+// Correct dot product (your old version didn’t multiply b)
 func dot(a, b []float64) float64 {
 	s := 0.0
 	for i := range a {
-		s += a[i]
+		s += a[i] * b[i]
 	}
 	return s
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   Param placement
+   Param placement / init
    ───────────────────────────────────────────────────────────────────────────── */
 
 func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnParams[T] {
 	cfg := curr.Attn
 	if cfg == nil || cfg.DK <= 0 {
 		return nil
+	}
+	H := defHeads(cfg)
+	dk := cfg.DK
+
+	mk := func() *AttnParams[T] {
+		p := &AttnParams[T]{DK: dk, Heads: H}
+		p.Wq = make([][]T, H)
+		p.Wk = make([][]T, H)
+		p.Wv = make([][]T, H)
+		scale := 1.0 / math.Sqrt(float64(dk))
+		for h := 0; h < H; h++ {
+			p.Wq[h] = randInitVec[T](dk, scale)
+			p.Wk[h] = randInitVec[T](dk, scale)
+			p.Wv[h] = randInitVec[T](dk, scale)
+		}
+		if cfg.UseWo {
+			p.Wo = randInitVec[T](H*dk*curr.Height, scale)
+		}
+		return p
 	}
 
 	if cfg.Share == "per-slice" {
@@ -136,35 +169,22 @@ func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnPar
 		if p, ok := curr.attnSlices[col]; ok {
 			return p
 		}
-		p := &AttnParams[T]{DK: cfg.DK}
-		scale := 1.0 / math.Sqrt(float64(cfg.DK))
-		p.Wq = randInitVec[T](cfg.DK, scale)
-		p.Wk = randInitVec[T](cfg.DK, scale)
-		p.Wv = randInitVec[T](cfg.DK, scale)
-		if cfg.UseWo {
-			p.Wo = randInitVec[T](cfg.DK*curr.Height, scale)
-		}
+		p := mk()
 		curr.attnSlices[col] = p
 		return p
 	}
 
+	// default: "layer"
 	if curr.attnLayer != nil {
 		return curr.attnLayer
 	}
-	p := &AttnParams[T]{DK: cfg.DK}
-	scale := 1.0 / math.Sqrt(float64(cfg.DK))
-	p.Wq = randInitVec[T](cfg.DK, scale)
-	p.Wk = randInitVec[T](cfg.DK, scale)
-	p.Wv = randInitVec[T](cfg.DK, scale)
-	if cfg.UseWo {
-		p.Wo = randInitVec[T](cfg.DK*curr.Height, scale)
-	}
+	p := mk()
 	curr.attnLayer = p
 	return p
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   Forward
+   Forward (multi-head)
    ───────────────────────────────────────────────────────────────────────────── */
 
 func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
@@ -181,118 +201,131 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 	}
 
 	N := prev.Width * prev.Height
+	H := params.Heads
 	dk := params.DK
-	if N == 0 || dk == 0 {
+	if N == 0 || dk == 0 || H <= 0 {
 		return
 	}
+	Hd := H * dk // concat size
 
 	// 1) Tokens
 	X := make([]float64, N)
-	idx := 0
-	for y := 0; y < prev.Height; y++ {
-		for x := 0; x < prev.Width; x++ {
-			X[idx] = f64(prev.Neurons[y][x].Value)
-			idx++
-		}
-	}
-	if cfg.PosEnc2D {
-		addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
-	}
-
-	// 2) Q,K,V
-	Q := make([][]float64, N)
-	K := make([][]float64, N)
-	V := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		q := make([]float64, dk)
-		k := make([]float64, dk)
-		v := make([]float64, dk)
-		x := X[i]
-		for j := 0; j < dk; j++ {
-			q[j] = x * f64(params.Wq[j])
-			k[j] = x * f64(params.Wk[j])
-			v[j] = x * f64(params.Wv[j])
-		}
-		Q[i], K[i], V[i] = q, k, v
-	}
-
-	// 3) Attention
-	scale := 1.0 / math.Sqrt(float64(dk))
-	A := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		row := make([]float64, N)
-		for j := 0; j < N; j++ {
-			row[j] = scale * dot(Q[i], K[j])
-		}
-		A[i] = row
-	}
-	softmaxRowsInPlace(A)
-
-	// 4) Z = A V
-	Z := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		zi := make([]float64, dk)
-		for j := 0; j < N; j++ {
-			a := A[i][j]
-			if a == 0 {
-				continue
+	{
+		idx := 0
+		for y := 0; y < prev.Height; y++ {
+			for x := 0; x < prev.Width; x++ {
+				X[idx] = f64(prev.Neurons[y][x].Value)
+				idx++
 			}
-			vj := V[j]
+		}
+		if cfg.PosEnc2D {
+			addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
+		}
+	}
+
+	// 2) Multi-head projections & attention
+	zbarCat := make([]float64, Hd) // concat of per-head pooled features
+	headOffset := 0
+
+	for h := 0; h < H; h++ {
+		// Q,K,V ∈ [N][dk]
+		Q := make([][]float64, N)
+		K := make([][]float64, N)
+		V := make([][]float64, N)
+		wqh := params.Wq[h]
+		wkh := params.Wk[h]
+		wvh := params.Wv[h]
+
+		for i := 0; i < N; i++ {
+			q := make([]float64, dk)
+			k := make([]float64, dk)
+			v := make([]float64, dk)
+			x := X[i]
+			for j := 0; j < dk; j++ {
+				q[j] = x * f64(wqh[j])
+				k[j] = x * f64(wkh[j])
+				v[j] = x * f64(wvh[j])
+			}
+			Q[i], K[i], V[i] = q, k, v
+		}
+
+		// Scores / softmax
+		scale := 1.0 / math.Sqrt(float64(dk))
+		A := make([][]float64, N)
+		for i := 0; i < N; i++ {
+			row := make([]float64, N)
+			for j := 0; j < N; j++ {
+				row[j] = scale * dot(Q[i], K[j])
+			}
+			A[i] = row
+		}
+		softmaxRowsInPlace(A)
+
+		// Z = A V  → pool to zbar_h
+		zbarH := make([]float64, dk)
+		for i := 0; i < N; i++ {
+			zi := make([]float64, dk)
+			Ai := A[i]
+			for j := 0; j < N; j++ {
+				a := Ai[j]
+				if a == 0 {
+					continue
+				}
+				vj := V[j]
+				for t := 0; t < dk; t++ {
+					zi[t] += a * vj[t]
+				}
+			}
 			for t := 0; t < dk; t++ {
-				zi[t] += a * vj[t]
+				zbarH[t] += zi[t]
 			}
 		}
-		Z[i] = zi
-	}
-
-	// 5) Pool
-	zbar := make([]float64, dk)
-	for i := 0; i < N; i++ {
-		zi := Z[i]
+		invN := 1.0 / float64(N)
 		for t := 0; t < dk; t++ {
-			zbar[t] += zi[t]
+			zbarH[t] *= invN
 		}
-	}
-	invN := 1.0 / float64(N)
-	for t := 0; t < dk; t++ {
-		zbar[t] *= invN
+
+		// concat
+		copy(zbarCat[headOffset:headOffset+dk], zbarH)
+		headOffset += dk
 	}
 
-	// Optional norm
+	// Optional norm over concatenated vector
 	if cfg.UseNorm {
 		eps := defNormEps(cfg)
 		mu := 0.0
-		for t := 0; t < dk; t++ {
-			mu += zbar[t]
+		for t := 0; t < Hd; t++ {
+			mu += zbarCat[t]
 		}
-		mu /= float64(dk)
+		mu /= float64(Hd)
 		vv := 0.0
-		for t := 0; t < dk; t++ {
-			d := zbar[t] - mu
+		for t := 0; t < Hd; t++ {
+			d := zbarCat[t] - mu
 			vv += d * d
 		}
-		vv /= float64(dk)
+		vv /= float64(Hd)
 		invStd := 1.0 / math.Sqrt(vv+eps)
-		for t := 0; t < dk; t++ {
-			zbar[t] = (zbar[t] - mu) * invStd
+		for t := 0; t < Hd; t++ {
+			zbarCat[t] = (zbarCat[t] - mu) * invStd
 		}
 	}
 
-	// 6) Project
+	// 3) Project to column
 	out := make([]float64, curr.Height)
-	if cfg.UseWo && len(params.Wo) == dk*curr.Height {
+	if cfg.UseWo && len(params.Wo) == Hd*curr.Height {
 		for y := 0; y < curr.Height; y++ {
 			sum := 0.0
-			base := y * dk
-			for t := 0; t < dk; t++ {
-				sum += zbar[t] * f64(params.Wo[base+t])
+			base := y * Hd
+			for t := 0; t < Hd; t++ {
+				sum += zbarCat[t] * f64(params.Wo[base+t])
 			}
 			out[y] = sum
 		}
 	} else {
+		// simple fallback
 		sum := 0.0
-		for t := 0; t < dk; t++ {
-			sum += zbar[t]
+		for t := 0; t < Hd; t++ {
+			sum += zbarCat[t]
 		}
 		for y := 0; y < curr.Height; y++ {
 			alpha := float64(y) / float64(max(1, curr.Height-1))
@@ -300,7 +333,7 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 		}
 	}
 
-	// 7) Activation (+ optional replay gain)
+	// 4) Activation (+ optional replay gain)
 	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
 	replayGain := defReplayGain(cfg)
 	for y := 0; y < curr.Height; y++ {
@@ -314,7 +347,7 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
-   Backward
+   Backward (multi-head)
    ───────────────────────────────────────────────────────────────────────────── */
 
 func (n *Network[T]) backwardAttnColumn(
@@ -339,12 +372,14 @@ func (n *Network[T]) backwardAttnColumn(
 	}
 
 	N := prev.Width * prev.Height
+	H := params.Heads
 	dk := params.DK
-	if N == 0 || dk == 0 {
+	if N == 0 || dk == 0 || H <= 0 {
 		return
 	}
+	Hd := H * dk
 
-	// upstream grad
+	// Upstream grad (+ replay gain if enabled)
 	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
 	replayGain := defReplayGain(cfg)
 
@@ -357,235 +392,197 @@ func (n *Network[T]) backwardAttnColumn(
 		dy[y] = v
 	}
 
-	// Recompute intermediates (same as forward)
+	// Recompute intermediates (tokens)
 	X := make([]float64, N)
-	idx := 0
-	for y := 0; y < prev.Height; y++ {
-		for x := 0; x < prev.Width; x++ {
-			X[idx] = f64(prev.Neurons[y][x].Value)
-			idx++
-		}
-	}
-	if cfg.PosEnc2D {
-		addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
-	}
-
-	Q := make([][]float64, N)
-	K := make([][]float64, N)
-	V := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		q := make([]float64, dk)
-		k := make([]float64, dk)
-		v := make([]float64, dk)
-		x := X[i]
-		for t := 0; t < dk; t++ {
-			q[t] = x * f64(params.Wq[t])
-			k[t] = x * f64(params.Wk[t])
-			v[t] = x * f64(params.Wv[t])
-		}
-		Q[i], K[i], V[i] = q, k, v
-	}
-
-	scale := 1.0 / math.Sqrt(float64(dk))
-	A := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		row := make([]float64, N)
-		for j := 0; j < N; j++ {
-			row[j] = scale * dot(Q[i], K[j])
-		}
-		A[i] = row
-	}
-	softmaxRowsInPlace(A)
-
-	Z := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		zi := make([]float64, dk)
-		for j := 0; j < N; j++ {
-			a := A[i][j]
-			if a == 0 {
-				continue
+	{
+		idx := 0
+		for y := 0; y < prev.Height; y++ {
+			for x := 0; x < prev.Width; x++ {
+				X[idx] = f64(prev.Neurons[y][x].Value)
+				idx++
 			}
-			vj := V[j]
+		}
+		if cfg.PosEnc2D {
+			addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
+		}
+	}
+
+	// Per-head caches (to avoid re-alloc inside loops)
+	type headCache struct {
+		Q [][]float64
+		K [][]float64
+		V [][]float64
+		A [][]float64
+		Z [][]float64
+		// pooled head feature
+		zbar []float64
+	}
+	heads := make([]headCache, H)
+
+	// Forward recompute per head
+	for h := 0; h < H; h++ {
+		wqh := params.Wq[h]
+		wkh := params.Wk[h]
+		wvh := params.Wv[h]
+
+		Q := make([][]float64, N)
+		K := make([][]float64, N)
+		V := make([][]float64, N)
+		for i := 0; i < N; i++ {
+			q := make([]float64, dk)
+			k := make([]float64, dk)
+			v := make([]float64, dk)
+			x := X[i]
 			for t := 0; t < dk; t++ {
-				zi[t] += a * vj[t]
+				q[t] = x * f64(wqh[t])
+				k[t] = x * f64(wkh[t])
+				v[t] = x * f64(wvh[t])
+			}
+			Q[i], K[i], V[i] = q, k, v
+		}
+		scale := 1.0 / math.Sqrt(float64(dk))
+		A := make([][]float64, N)
+		for i := 0; i < N; i++ {
+			row := make([]float64, N)
+			for j := 0; j < N; j++ {
+				row[j] = scale * dot(Q[i], K[j])
+			}
+			A[i] = row
+		}
+		softmaxRowsInPlace(A)
+
+		Z := make([][]float64, N)
+		zbar := make([]float64, dk)
+		for i := 0; i < N; i++ {
+			zi := make([]float64, dk)
+			Ai := A[i]
+			for j := 0; j < N; j++ {
+				a := Ai[j]
+				if a == 0 {
+					continue
+				}
+				vj := V[j]
+				for t := 0; t < dk; t++ {
+					zi[t] += a * vj[t]
+				}
+			}
+			Z[i] = zi
+			for t := 0; t < dk; t++ {
+				zbar[t] += zi[t]
 			}
 		}
-		Z[i] = zi
-	}
-
-	zbar := make([]float64, dk)
-	for i := 0; i < N; i++ {
-		zi := Z[i]
+		invN := 1.0 / float64(N)
 		for t := 0; t < dk; t++ {
-			zbar[t] += zi[t]
+			zbar[t] *= invN
 		}
-	}
-	invN := 1.0 / float64(N)
-	for t := 0; t < dk; t++ {
-		zbar[t] *= invN
+		heads[h] = headCache{Q: Q, K: K, V: V, A: A, Z: Z, zbar: zbar}
 	}
 
-	// optional norm (cache stats)
+	// Concat zbar for norm + projection
+	zbarCat := make([]float64, Hd)
+	off := 0
+	for h := 0; h < H; h++ {
+		copy(zbarCat[off:off+dk], heads[h].zbar)
+		off += dk
+	}
+
+	// Norm (cache)
 	useNorm := cfg.UseNorm
 	eps := defNormEps(cfg)
-
 	var mu, invStd float64
 	var yhat []float64
 	if useNorm {
 		mu = 0.0
-		for t := 0; t < dk; t++ {
-			mu += zbar[t]
+		for t := 0; t < Hd; t++ {
+			mu += zbarCat[t]
 		}
-		mu /= float64(dk)
+		mu /= float64(Hd)
 		vv := 0.0
-		for t := 0; t < dk; t++ {
-			d := zbar[t] - mu
+		for t := 0; t < Hd; t++ {
+			d := zbarCat[t] - mu
 			vv += d * d
 		}
-		vv /= float64(dk)
+		vv /= float64(Hd)
 		invStd = 1.0 / math.Sqrt(vv+eps)
-		yhat = make([]float64, dk)
-		for t := 0; t < dk; t++ {
-			yhat[t] = (zbar[t] - mu) * invStd
+		yhat = make([]float64, Hd)
+		for t := 0; t < Hd; t++ {
+			yhat[t] = (zbarCat[t] - mu) * invStd
 		}
 	}
 
-	// grads
-	dZ := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		dZ[i] = make([]float64, dk)
-	}
-
-	dA := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		dA[i] = make([]float64, N)
-	}
-
-	dV := make([][]float64, N)
-	for j := 0; j < N; j++ {
-		dV[j] = make([]float64, dk)
-	}
-
-	dQ := make([][]float64, N)
-	dK := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		dQ[i] = make([]float64, dk)
-		dK[i] = make([]float64, dk)
-	}
-	dX := make([]float64, N)
-
-	gWq := make([]float64, dk)
-	gWk := make([]float64, dk)
-	gWv := make([]float64, dk)
+	// Grad buffers
+	dZbarCat := make([]float64, Hd) // gradient wrt (concat) pre-norm vector (or pre-Wo if no norm)
 	var gWo []float64
-	if cfg.UseWo && len(params.Wo) == dk*curr.Height {
-		gWo = make([]float64, dk*curr.Height)
+	if cfg.UseWo && len(params.Wo) == Hd*curr.Height {
+		gWo = make([]float64, Hd*curr.Height)
 	}
 
-	// back from projection
-	dZbar := make([]float64, dk)
+	// Back from projection
 	if cfg.UseWo && gWo != nil {
 		for y := 0; y < curr.Height; y++ {
-			base := y * dk
 			gy := dy[y]
-			for t := 0; t < dk; t++ {
-				gWo[base+t] += zbar[t] * gy
-				dZbar[t] += f64(params.Wo[base+t]) * gy
+			base := y * Hd
+			for t := 0; t < Hd; t++ {
+				gWo[base+t] += zbarCat[t] * gy
+				dZbarCat[t] += f64(params.Wo[base+t]) * gy
 			}
 		}
 	} else {
+		// fallback projection used in forward
 		sumScale := 0.0
 		den := float64(max(1, curr.Height-1))
 		for y := 0; y < curr.Height; y++ {
 			alpha := float64(y) / den
 			sumScale += dy[y] * (1.0 - 0.5*alpha)
 		}
-		for t := 0; t < dk; t++ {
-			dZbar[t] += sumScale
+		for t := 0; t < Hd; t++ {
+			dZbarCat[t] += sumScale
 		}
 	}
 
-	// back through norm (if used)
+	// Back through norm if used: yhat = Norm(zbarCat)
 	if useNorm {
-		g := dZbar
+		g := dZbarCat
 		meanG := 0.0
 		meanGY := 0.0
-		for t := 0; t < dk; t++ {
+		for t := 0; t < Hd; t++ {
 			meanG += g[t]
 			meanGY += g[t] * yhat[t]
 		}
-		meanG /= float64(dk)
-		meanGY /= float64(dk)
-		for t := 0; t < dk; t++ {
-			dZbar[t] = (g[t] - meanG - yhat[t]*meanGY) * invStd
+		meanG /= float64(Hd)
+		meanGY /= float64(Hd)
+		for t := 0; t < Hd; t++ {
+			dZbarCat[t] = (g[t] - meanG - yhat[t]*meanGY) * invStd
 		}
 	}
 
-	// zbar = mean_i Z[i]
+	// Split dZbarCat to per-head dZbar
+	dZbarPerHead := make([][]float64, H)
+	off = 0
+	for h := 0; h < H; h++ {
+		dZbarPerHead[h] = make([]float64, dk)
+		copy(dZbarPerHead[h], dZbarCat[off:off+dk])
+		off += dk
+	}
+
+	// Now back through each head: Zbar_h = mean_i Z_h[i]
+	// Accumulate grads for Wq/Wk/Wv and X
+	dQ := make([][]float64, N)
+	dK := make([][]float64, N)
 	for i := 0; i < N; i++ {
-		for t := 0; t < dk; t++ {
-			dZ[i][t] += dZbar[t] * invN
-		}
+		dQ[i] = make([]float64, dk) // per head scratch; will reuse
+		dK[i] = make([]float64, dk)
 	}
-
-	// Z = A V
+	dV := make([][]float64, N)
+	for j := 0; j < N; j++ {
+		dV[j] = make([]float64, dk)
+	}
+	dS := make([][]float64, N) // per head softmax grad; reused
 	for i := 0; i < N; i++ {
-		zi := dZ[i]
-		Ai := A[i]
-		for j := 0; j < N; j++ {
-			aij := Ai[j]
-			if aij == 0 {
-				continue
-			}
-			for t := 0; t < dk; t++ {
-				dV[j][t] += aij * zi[t]
-			}
-			dA[i][j] += dot(zi, V[j])
-		}
+		dS[i] = make([]float64, N)
 	}
+	dX := make([]float64, N)
 
-	// A = softmax(S) row-wise
-	dS := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		row := make([]float64, N)
-		dotRow := 0.0
-		for j := 0; j < N; j++ {
-			dotRow += dA[i][j] * A[i][j]
-		}
-		for j := 0; j < N; j++ {
-			row[j] = (dA[i][j] - dotRow) * A[i][j]
-		}
-		dS[i] = row
-	}
-
-	// S = (Q Kᵀ)/√dk
-	for i := 0; i < N; i++ {
-		for j := 0; j < N; j++ {
-			g := dS[i][j] * (1.0 / math.Sqrt(float64(dk)))
-			if g == 0 {
-				continue
-			}
-			for t := 0; t < dk; t++ {
-				dQ[i][t] += g * K[j][t]
-				dK[j][t] += g * Q[i][t]
-			}
-		}
-	}
-
-	// back to params & X
-	for i := 0; i < N; i++ {
-		x := X[i]
-		for t := 0; t < dk; t++ {
-			gWq[t] += x * dQ[i][t]
-			gWk[t] += x * dK[i][t]
-			gWv[t] += x * dV[i][t]
-			dX[i] += dQ[i][t]*f64(params.Wq[t]) +
-				dK[i][t]*f64(params.Wk[t]) +
-				dV[i][t]*f64(params.Wv[t])
-		}
-	}
-
-	// clip + SGD
 	clip := func(g float64) float64 {
 		up := float64(clipUpper)
 		lo := float64(clipLower)
@@ -597,10 +594,113 @@ func (n *Network[T]) backwardAttnColumn(
 		}
 		return g
 	}
-	for t := 0; t < dk; t++ {
-		params.Wq[t] += T(lr * clip(gWq[t]))
-		params.Wk[t] += T(lr * clip(gWk[t]))
-		params.Wv[t] += T(lr * clip(gWv[t]))
+
+	// Grad buffers for params
+	gWq := make([][]float64, H)
+	gWk := make([][]float64, H)
+	gWv := make([][]float64, H)
+	for h := 0; h < H; h++ {
+		gWq[h] = make([]float64, dk)
+		gWk[h] = make([]float64, dk)
+		gWv[h] = make([]float64, dk)
+	}
+
+	invN := 1.0 / float64(N)
+
+	for h := 0; h < H; h++ {
+		Q := heads[h].Q
+		K := heads[h].K
+		V := heads[h].V
+		A := heads[h].A
+		Z := heads[h].Z
+		dZbar := dZbarPerHead[h]
+
+		// 1) dZ[i] += dZbar / N
+		for i := 0; i < N; i++ {
+			for t := 0; t < dk; t++ {
+				Z[i][t] = dZbar[t] * invN // reuse Z as dZ to save alloc
+			}
+		}
+
+		// 2) Back through Z = A V
+		//    dV += Aᵀ dZ ; dA += dZ Vᵀ
+		for i := 0; i < N; i++ {
+			zi := Z[i] // actually dZ now
+			Ai := A[i]
+			for j := 0; j < N; j++ {
+				aij := Ai[j]
+				if aij == 0 {
+					continue
+				}
+				for t := 0; t < dk; t++ {
+					dV[j][t] += aij * zi[t]
+				}
+				dS[i][j] = dot(zi, V[j]) // store into dS for next step
+			}
+		}
+
+		// 3) Back through softmax rows: dS -> (dA)
+		for i := 0; i < N; i++ {
+			row := dS[i] // currently holds dA[i][*]
+			sum := 0.0
+			for j := 0; j < N; j++ {
+				sum += row[j] * A[i][j]
+			}
+			for j := 0; j < N; j++ {
+				row[j] = (row[j] - sum) * A[i][j] // now row = dS[i][*]
+			}
+		}
+
+		// 4) Back through S = (QKᵀ)/√dk
+		invScale := 1.0 / math.Sqrt(float64(dk))
+		for i := 0; i < N; i++ {
+			for j := 0; j < N; j++ {
+				g := dS[i][j] * invScale
+				if g == 0 {
+					continue
+				}
+				for t := 0; t < dk; t++ {
+					dQ[i][t] += g * K[j][t]
+					dK[j][t] += g * Q[i][t]
+				}
+			}
+		}
+
+		// 5) Back to params and X (per head)
+		for i := 0; i < N; i++ {
+			x := X[i]
+			for t := 0; t < dk; t++ {
+				gWq[h][t] += x * dQ[i][t]
+				gWk[h][t] += x * dK[i][t]
+				gWv[h][t] += x * dV[i][t]
+				dX[i] += dQ[i][t]*f64(params.Wq[h][t]) +
+					dK[i][t]*f64(params.Wk[h][t]) +
+					dV[i][t]*f64(params.Wv[h][t])
+			}
+		}
+
+		// zero per-head scratch for next head
+		for i := 0; i < N; i++ {
+			for t := 0; t < dk; t++ {
+				dQ[i][t] = 0
+				dK[i][t] = 0
+				dV[i][t] = 0
+			}
+		}
+		for i := 0; i < N; i++ {
+			for j := 0; j < N; j++ {
+				dS[i][j] = 0
+			}
+		}
+	}
+
+	// Apply clipping + SGD updates
+	for h := 0; h < H; h++ {
+		for t := 0; t < dk; t++ {
+			params.Wq[h][t] += T(lr * clip(gWq[h][t]))
+			params.Wk[h][t] += T(lr * clip(gWk[h][t]))
+			params.Wv[h][t] += T(lr * clip(gWv[h][t]))
+		}
 	}
 	if gWo != nil {
 		for i := 0; i < len(gWo); i++ {
@@ -608,7 +708,7 @@ func (n *Network[T]) backwardAttnColumn(
 		}
 	}
 
-	// scatter to prev err
+	// Scatter to prev layer error
 	iTok := 0
 	for y := 0; y < prev.Height; y++ {
 		for x := 0; x < prev.Width; x++ {

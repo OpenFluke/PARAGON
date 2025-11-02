@@ -9,7 +9,7 @@ import (
 )
 
 /* =============================================================================
-   Wire types (JSON schema)
+   Wire types (JSON schema)  — v3 (multi-head)
    ========================================================================== */
 
 // Whole file format (can hold multiple models)
@@ -50,28 +50,46 @@ type LayerCfg struct {
 }
 
 type AttnCfgWire struct {
-	DK       int     `json:"dk"`
-	UseWo    bool    `json:"useWo"`
-	Share    string  `json:"share"`    // "layer" | "per-slice"
-	Dropout  float32 `json:"dropout"`  // training only
-	PosEnc2D bool    `json:"posEnc2D"` // spatial awareness
+	// Multi-head
+	Heads int  `json:"heads,omitempty"` // default 1 if absent/zero
+	DK    int  `json:"dk"`
+	UseWo bool `json:"useWo"`
 
-	// NEW (v2): keep these omitempty for back-compat with v1 bundles
-	UseNorm     bool    `json:"useNorm,omitempty"`
-	PosEncAmp   float64 `json:"posEncAmp,omitempty"`
-	NormEps     float64 `json:"normEps,omitempty"`
+	Share    string  `json:"share"`    // "layer" | "per-slice"
+	Dropout  float32 `json:"dropout"`  // training only (no-op here)
+	PosEnc2D bool    `json:"posEnc2D"` // spatial awareness
+	UseNorm  bool    `json:"useNorm,omitempty"`
+
+	// Tunables (v2+; keep omitempty for back-compat)
+	PosEncAmp float64 `json:"posEncAmp,omitempty"`
+	NormEps   float64 `json:"normEps,omitempty"`
+
+	// Replay controls (v2+)
 	UseReplay   bool    `json:"useReplay,omitempty"`
 	ForceReplay bool    `json:"forceReplay,omitempty"`
 	ReplayGain  float64 `json:"replayGain,omitempty"`
 }
 
-// Learned attention parameter payload
+// Learned attention parameter payload (v3: per-head)
 type AttnParamsWire struct {
-	Wq []float64 `json:"wq"`           // len = dk
-	Wk []float64 `json:"wk"`           // len = dk
-	Wv []float64 `json:"wv"`           // len = dk
-	Wo []float64 `json:"wo,omitempty"` // len = dk * Hcurr (only when UseWo)
-	DK int       `json:"dk"`
+	// Per-head projection weights; each inner slice len = dk
+	Wq [][]float64 `json:"wq,omitempty"` // shape: [heads][dk]
+	Wk [][]float64 `json:"wk,omitempty"` // shape: [heads][dk]
+	Wv [][]float64 `json:"wv,omitempty"` // shape: [heads][dk]
+
+	// Output projection over concatenated heads: len = (heads*dk)*Hcurr, row-major
+	Wo []float64 `json:"wo,omitempty"`
+
+	// Meta
+	DK    int `json:"dk"`
+	Heads int `json:"heads,omitempty"`
+
+	/* Back-compat (v1/v2 single-head):
+	   If these are present (flat vectors), we will wrap them into [][] with Heads=1.
+	*/
+	WqFlat []float64 `json:"wq_flat,omitempty"`
+	WkFlat []float64 `json:"wk_flat,omitempty"`
+	WvFlat []float64 `json:"wv_flat,omitempty"`
 }
 
 type ReplayCfg struct {
@@ -103,7 +121,7 @@ func ExportBundleJSON[T Numeric](id string, n *Network[T], seed *int64) (string,
 	}
 	bun := Bundle{
 		Type:    "modelhost/bundle",
-		Version: 2, // bumped
+		Version: 3, // bumped for multi-head
 		Models:  []BundleModel{m},
 	}
 	out, err := json.Marshal(bun)
@@ -125,12 +143,12 @@ func ImportBundleJSON(bundleJSON string) (any, error) {
 	if len(bun.Models) == 0 {
 		return nil, errors.New("bundle: no models")
 	}
-	// For now, return first model. (You can extend to select by ID.)
+	// For now, return first model. (Extend to select by ID if needed.)
 	nAny, err := UnpackModel(bun.Models[0])
 	if err != nil {
 		return nil, err
 	}
-	// Back-compat defaults for v1 (or sloppy emitters)
+	// Back-compat defaults for older bundles
 	switch n := nAny.(type) {
 	case *Network[float32]:
 		fillAttnDefaults(n)
@@ -235,7 +253,9 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 		}
 		// Attention knobs + PARAMS (persist)
 		if g.Attn != nil {
+			heads := defHeads(g.Attn)
 			lc.Attn = &AttnCfgWire{
+				Heads:       heads,
 				DK:          g.Attn.DK,
 				UseWo:       g.Attn.UseWo,
 				Share:       g.Attn.Share,
@@ -252,11 +272,15 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 			case "layer":
 				if g.attnLayer != nil {
 					lc.AttnParams = &AttnParamsWire{
-						DK: g.attnLayer.DK,
-						Wq: tVecToF64(g.attnLayer.Wq),
-						Wk: tVecToF64(g.attnLayer.Wk),
-						Wv: tVecToF64(g.attnLayer.Wv),
-						Wo: tVecToF64(g.attnLayer.Wo),
+						DK:    g.attnLayer.DK,
+						Heads: g.attnLayer.Heads,
+						Wq:    t2DToF64(g.attnLayer.Wq),
+						Wk:    t2DToF64(g.attnLayer.Wk),
+						Wv:    t2DToF64(g.attnLayer.Wv),
+						Wo:    tVecToF64(g.attnLayer.Wo),
+					}
+					if lc.AttnParams.Heads == 0 {
+						lc.AttnParams.Heads = heads
 					}
 				}
 			case "per-slice":
@@ -267,11 +291,15 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 							continue
 						}
 						lc.AttnParamsPerSlice[col] = &AttnParamsWire{
-							DK: p.DK,
-							Wq: tVecToF64(p.Wq),
-							Wk: tVecToF64(p.Wk),
-							Wv: tVecToF64(p.Wv),
-							Wo: tVecToF64(p.Wo),
+							DK:    p.DK,
+							Heads: p.Heads,
+							Wq:    t2DToF64(p.Wq),
+							Wk:    t2DToF64(p.Wk),
+							Wv:    t2DToF64(p.Wv),
+							Wo:    tVecToF64(p.Wo),
+						}
+						if lc.AttnParamsPerSlice[col].Heads == 0 {
+							lc.AttnParamsPerSlice[col].Heads = heads
 						}
 					}
 				}
@@ -322,20 +350,26 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 
 		// Attention knobs + PARAMS
 		if cl.Attn != nil {
-			gl.Attn = &AttnConfig[T]{
-				DK:          cl.Attn.DK,
-				UseWo:       cl.Attn.UseWo,
-				Share:       cl.Attn.Share,
-				Dropout:     cl.Attn.Dropout,
-				PosEnc2D:    cl.Attn.PosEnc2D,
-				UseNorm:     cl.Attn.UseNorm,
-				PosEncAmp:   cl.Attn.PosEncAmp,
-				NormEps:     cl.Attn.NormEps,
-				UseReplay:   cl.Attn.UseReplay,
-				ForceReplay: cl.Attn.ForceReplay,
-				ReplayGain:  cl.Attn.ReplayGain,
+			if gl.Attn == nil {
+				gl.Attn = &AttnConfig[T]{}
 			}
-			// Back-compat defaults for v1 bundles or zeroed fields
+			gl.Attn.Heads = cl.Attn.Heads
+			gl.Attn.DK = cl.Attn.DK
+			gl.Attn.UseWo = cl.Attn.UseWo
+			gl.Attn.Share = cl.Attn.Share
+			gl.Attn.Dropout = cl.Attn.Dropout
+			gl.Attn.PosEnc2D = cl.Attn.PosEnc2D
+			gl.Attn.UseNorm = cl.Attn.UseNorm
+			gl.Attn.PosEncAmp = cl.Attn.PosEncAmp
+			gl.Attn.NormEps = cl.Attn.NormEps
+			gl.Attn.UseReplay = cl.Attn.UseReplay
+			gl.Attn.ForceReplay = cl.Attn.ForceReplay
+			gl.Attn.ReplayGain = cl.Attn.ReplayGain
+
+			// Back-compat defaults for older bundles or zeroed fields
+			if gl.Attn.Heads <= 0 {
+				gl.Attn.Heads = 1
+			}
 			if gl.Attn.PosEncAmp == 0 {
 				gl.Attn.PosEncAmp = 1e-2
 			}
@@ -349,47 +383,35 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 				gl.Attn.Share = "layer"
 			}
 
+			// Clear any existing param caches; we’ll fill from wire (if present)
+			gl.attnLayer = nil
+			if gl.attnSlices != nil {
+				for k := range gl.attnSlices {
+					delete(gl.attnSlices, k)
+				}
+			}
+
+			// Load params
 			switch gl.Attn.Share {
 			case "layer":
 				if cl.AttnParams != nil {
-					gl.attnLayer = &AttnParams[T]{
-						DK: cl.AttnParams.DK,
-						Wq: f64VecToT[T](cl.AttnParams.Wq),
-						Wk: f64VecToT[T](cl.AttnParams.Wk),
-						Wv: f64VecToT[T](cl.AttnParams.Wv),
-						Wo: f64VecToT[T](cl.AttnParams.Wo),
-					}
-				} else {
-					gl.attnLayer = nil // allow lazy init if truly absent
+					p := attnParamsFromWire[T](cl.AttnParams)
+					gl.attnLayer = p
 				}
-				gl.attnSlices = nil
-
 			case "per-slice":
-				gl.attnLayer = nil
-				if gl.attnSlices == nil {
-					gl.attnSlices = make(map[int]*AttnParams[T])
-				} else {
-					for k := range gl.attnSlices {
-						delete(gl.attnSlices, k)
-					}
-				}
 				if cl.AttnParamsPerSlice != nil {
+					if gl.attnSlices == nil {
+						gl.attnSlices = make(map[int]*AttnParams[T], len(cl.AttnParamsPerSlice))
+					}
 					for col, pw := range cl.AttnParamsPerSlice {
 						if pw == nil {
 							continue
 						}
-						gl.attnSlices[col] = &AttnParams[T]{
-							DK: pw.DK,
-							Wq: f64VecToT[T](pw.Wq),
-							Wk: f64VecToT[T](pw.Wk),
-							Wv: f64VecToT[T](pw.Wv),
-							Wo: f64VecToT[T](pw.Wo),
-						}
+						gl.attnSlices[col] = attnParamsFromWire[T](pw)
 					}
 				}
 			default:
-				gl.attnLayer = nil
-				gl.attnSlices = nil
+				// leave nil; lazy-init later
 			}
 		}
 
@@ -426,7 +448,7 @@ func UnpackWeightsJSONB64(weightsB64 string) (any, error) {
 }
 
 /* =============================================================================
-   Small helpers: []T <-> []float64
+   Small helpers: []T/[][]T <-> []float64/[][]float64
    ========================================================================== */
 
 func tVecToF64[T Numeric](v []T) []float64 {
@@ -449,6 +471,56 @@ func f64VecToT[T Numeric](v []float64) []T {
 		out[i] = T(v[i])
 	}
 	return out
+}
+
+func t2DToF64[T Numeric](vv [][]T) [][]float64 {
+	if vv == nil {
+		return nil
+	}
+	out := make([][]float64, len(vv))
+	for i := range vv {
+		out[i] = tVecToF64(vv[i])
+	}
+	return out
+}
+
+func f642DToT[T Numeric](vv [][]float64) [][]T {
+	if vv == nil {
+		return nil
+	}
+	out := make([][]T, len(vv))
+	for i := range vv {
+		out[i] = f64VecToT[T](vv[i])
+	}
+	return out
+}
+
+/* =============================================================================
+   Param conversions: wire <-> runtime
+   ========================================================================== */
+
+func attnParamsFromWire[T Numeric](pw *AttnParamsWire) *AttnParams[T] {
+	if pw == nil {
+		return nil
+	}
+	p := &AttnParams[T]{DK: pw.DK, Heads: pw.Heads}
+	if p.Heads <= 0 {
+		// Back-compat: if flat vectors exist, wrap as single head
+		if len(pw.Wq) == 0 && len(pw.WqFlat) > 0 {
+			p.Heads = 1
+			p.Wq = [][]T{f64VecToT[T](pw.WqFlat)}
+			p.Wk = [][]T{f64VecToT[T](pw.WkFlat)}
+			p.Wv = [][]T{f64VecToT[T](pw.WvFlat)}
+		} else {
+			p.Heads = 1
+		}
+	} else {
+		p.Wq = f642DToT[T](pw.Wq)
+		p.Wk = f642DToT[T](pw.Wk)
+		p.Wv = f642DToT[T](pw.Wv)
+	}
+	p.Wo = f64VecToT[T](pw.Wo)
+	return p
 }
 
 /* =============================================================================
@@ -499,6 +571,9 @@ func fillAttnDefaults[T Numeric](n *Network[T]) {
 		g := &n.Layers[i]
 		if g.Attn == nil {
 			continue
+		}
+		if g.Attn.Heads <= 0 {
+			g.Attn.Heads = 1
 		}
 		if g.Attn.Share == "" {
 			g.Attn.Share = "layer"
