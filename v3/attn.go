@@ -6,29 +6,39 @@ import (
 	"math/rand"
 )
 
-// Per-layer attention knobs
+/* ─────────────────────────────────────────────────────────────────────────────
+   Attention config & params
+   ───────────────────────────────────────────────────────────────────────────── */
+
 type AttnConfig[T Numeric] struct {
-	DK       int     // head size (e.g., 32/48/64)
-	UseWo    bool    // apply output projection
+	DK       int     // head size
+	UseWo    bool    // output projection (dk x Hcurr)
 	Share    string  // "layer" | "per-slice"
-	Dropout  float32 // only used in training path
-	PosEnc2D bool    // (optional) tiny 2D pos-enc
+	Dropout  float32 // reserved for train-time
+	PosEnc2D bool    // add tiny 2D positional encoding to tokens
+	UseNorm  bool    // unit-norm zbar before Wo
+
+	// Tunables (default if zero):
+	PosEncAmp float64 // default 1e-2
+	NormEps   float64 // default 1e-6
+
+	// Replay controls (fully optional):
+	UseReplay   bool    // if true, allow replay gain path
+	ForceReplay bool    // if true, apply replay gain even when caller didn't flag isReplay
+	ReplayGain  float64 // default 1.1 (only used if UseReplay)
 }
 
-// Trainable params
 type AttnParams[T Numeric] struct {
-	// token_dim = 1 (scalar from prev grid). We'll project scalar → dk per token.
-	// Shapes:
-	//   Wq, Wk, Wv: (1 x dk) applied per-token ⇒ Q,K,V ∈ (N x dk)
-	//   Wo: (dk x Hcurr) to map pooled dk → column of length Hcurr
-	Wq []T
-	Wk []T
-	Wv []T
-	Wo []T // len = dk*Hcurr (only used if cfg.UseWo)
+	Wq []T // len=dk
+	Wk []T // len=dk
+	Wv []T // len=dk
+	Wo []T // len=dk*Hcurr (iff UseWo)
 	DK int
 }
 
-// --- small utils ---
+/* ─────────────────────────────────────────────────────────────────────────────
+   Small utils
+   ───────────────────────────────────────────────────────────────────────────── */
 
 func f64[T Numeric](v T) float64 { return float64(any(v).(T)) }
 func tOf[T Numeric](x float64) T { return T(x) }
@@ -41,17 +51,31 @@ func randInitVec[T Numeric](n int, scale float64) []T {
 	return out
 }
 
-func addTinyPosEnc2D[T Numeric](x []float64, prev *Grid[T]) {
-	// x: length N = prev.W * prev.H, scalar tokens
-	// inject tiny bias by row/col sin/cos so attention can localize
-	if prev.Width == 0 || prev.Height == 0 {
+func defPosEncAmp[T Numeric](cfg *AttnConfig[T]) float64 {
+	if cfg == nil || cfg.PosEncAmp == 0 {
+		return 1e-2
+	}
+	return cfg.PosEncAmp
+}
+
+func defNormEps[T Numeric](cfg *AttnConfig[T]) float64 {
+	if cfg == nil || cfg.NormEps == 0 {
+		return 1e-6
+	}
+	return cfg.NormEps
+}
+
+func defReplayGain[T Numeric](cfg *AttnConfig[T]) float64 {
+	if cfg == nil || cfg.ReplayGain == 0 {
+		return 1.1
+	}
+	return cfg.ReplayGain
+}
+
+func addTinyPosEnc2DWithAmp[T Numeric](x []float64, prev *Grid[T], amp float64) {
+	if prev.Width == 0 || prev.Height == 0 || len(x) != prev.Width*prev.Height || amp == 0 {
 		return
 	}
-	N := prev.Width * prev.Height
-	if len(x) != N {
-		return
-	}
-	amp := 0.01
 	for y := 0; y < prev.Height; y++ {
 		for c := 0; c < prev.Width; c++ {
 			i := y*prev.Width + c
@@ -63,10 +87,8 @@ func addTinyPosEnc2D[T Numeric](x []float64, prev *Grid[T]) {
 }
 
 func softmaxRowsInPlace(s [][]float64) {
-	// s: [N][N] scores; softmax over each row j
 	for i := range s {
 		row := s[i]
-		// stable softmax
 		mx := row[0]
 		for _, v := range row {
 			if v > mx {
@@ -92,10 +114,14 @@ func softmaxRowsInPlace(s [][]float64) {
 func dot(a, b []float64) float64 {
 	s := 0.0
 	for i := range a {
-		s += a[i] * b[i]
+		s += a[i]
 	}
 	return s
 }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Param placement
+   ───────────────────────────────────────────────────────────────────────────── */
 
 func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnParams[T] {
 	cfg := curr.Attn
@@ -111,7 +137,6 @@ func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnPar
 			return p
 		}
 		p := &AttnParams[T]{DK: cfg.DK}
-		// init Wq/Wk/Wv (1 x dk)
 		scale := 1.0 / math.Sqrt(float64(cfg.DK))
 		p.Wq = randInitVec[T](cfg.DK, scale)
 		p.Wk = randInitVec[T](cfg.DK, scale)
@@ -123,7 +148,6 @@ func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnPar
 		return p
 	}
 
-	// default: "layer"
 	if curr.attnLayer != nil {
 		return curr.attnLayer
 	}
@@ -139,15 +163,18 @@ func ensureAttnParams[T Numeric](curr *Grid[T], prev *Grid[T], col int) *AttnPar
 	return p
 }
 
-// Forward: computes all y in column `col`, writes curr.Neurons[y][col].Value
+/* ─────────────────────────────────────────────────────────────────────────────
+   Forward
+   ───────────────────────────────────────────────────────────────────────────── */
+
 func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 	curr := &n.Layers[layerIdx]
 	prev := &n.Layers[layerIdx-1]
 	cfg := curr.Attn
 	if cfg == nil || cfg.DK <= 0 {
-		// No config: do nothing (or choose a fallback)
 		return
 	}
+
 	params := ensureAttnParams[T](curr, prev, col)
 	if params == nil {
 		return
@@ -159,7 +186,7 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 		return
 	}
 
-	// 1) tokens X: scalar per prev cell → float64 scratch
+	// 1) Tokens
 	X := make([]float64, N)
 	idx := 0
 	for y := 0; y < prev.Height; y++ {
@@ -169,161 +196,10 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 		}
 	}
 	if cfg.PosEnc2D {
-		addTinyPosEnc2D(X, prev)
+		addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
 	}
 
-	// 2) Per-token projections (scalar * (1×dk) → (dk))
-	// Q,K,V: shape [N][dk]
-	Q := make([][]float64, N)
-	K := make([][]float64, N)
-	V := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		q := make([]float64, dk)
-		k := make([]float64, dk)
-		v := make([]float64, dk)
-		x := X[i]
-		// Wq/Wk/Wv are (1 x dk) flattened
-		for j := 0; j < dk; j++ {
-			q[j] = x * f64(params.Wq[j])
-			k[j] = x * f64(params.Wk[j])
-			v[j] = x * f64(params.Wv[j])
-		}
-		Q[i], K[i], V[i] = q, k, v
-	}
-
-	// 3) Scores S = softmax( Q K^T / sqrt(dk) ) over j for each i
-	scale := 1.0 / math.Sqrt(float64(dk))
-	S := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		row := make([]float64, N)
-		for j := 0; j < N; j++ {
-			row[j] = scale * dot(Q[i], K[j])
-		}
-		S[i] = row
-	}
-	softmaxRowsInPlace(S)
-
-	// 4) Z = S V  (N×N @ N×dk => N×dk)
-	Z := make([][]float64, N)
-	for i := 0; i < N; i++ {
-		zi := make([]float64, dk)
-		// zi = Σ_j S[i][j] * V[j]
-		for j := 0; j < N; j++ {
-			w := S[i][j]
-			if w == 0 {
-				continue
-			}
-			vj := V[j]
-			for t := 0; t < dk; t++ {
-				zi[t] += w * vj[t]
-			}
-		}
-		Z[i] = zi
-	}
-
-	// 5) Pool tokens → zbar (dk)
-	zbar := make([]float64, dk)
-	for i := 0; i < N; i++ {
-		zi := Z[i]
-		for t := 0; t < dk; t++ {
-			zbar[t] += zi[t]
-		}
-	}
-	invN := 1.0 / float64(N)
-	for t := 0; t < dk; t++ {
-		zbar[t] *= invN
-	}
-
-	// 6) Project to column of size Hcurr
-	out := make([]float64, curr.Height)
-	if cfg.UseWo && len(params.Wo) == dk*curr.Height {
-		// y = zbar · Wo  (dk x Hcurr)
-		for y := 0; y < curr.Height; y++ {
-			sum := 0.0
-			base := y * dk
-			for t := 0; t < dk; t++ {
-				sum += zbar[t] * f64(params.Wo[base+t])
-			}
-			out[y] = sum
-		}
-	} else {
-		// Fallback: simple channel reduction → broadcast or banded map
-		// Here: sum zbar then spread across y with a mild slope
-		sum := 0.0
-		for t := 0; t < dk; t++ {
-			sum += zbar[t]
-		}
-		for y := 0; y < curr.Height; y++ {
-			alpha := float64(y) / float64(max(1, curr.Height-1))
-			out[y] = (1.0-alpha)*sum + alpha*sum*0.5
-		}
-	}
-
-	// 7) Activation + replay gain + write column
-	for y := 0; y < curr.Height; y++ {
-		val := tOf[T](out[y])
-		val = ApplyActivationGeneric(val, curr.Neurons[y][col].Activation)
-		if isReplay {
-			val = tOf[T](float64(val) * 1.1)
-		}
-		curr.Neurons[y][col].Value = val
-	}
-}
-
-//------------training
-
-func (n *Network[T]) backwardAttnColumn(
-	layerIdx int,
-	col int,
-	err [][][]T,
-	lr float64,
-	clipUpper T,
-	clipLower T,
-	isReplay bool,
-) {
-	curr := &n.Layers[layerIdx]
-	prev := &n.Layers[layerIdx-1]
-	cfg := curr.Attn
-	if cfg == nil || cfg.DK <= 0 {
-		return
-	}
-	params := ensureAttnParams[T](curr, prev, col)
-	if params == nil {
-		return
-	}
-
-	N := prev.Width * prev.Height
-	dk := params.DK
-	if N == 0 || dk == 0 {
-		return
-	}
-
-	// === 0) Upstream gradient dy for this column (post-activation) ===
-	dy := make([]float64, curr.Height)
-	for y := 0; y < curr.Height; y++ {
-		v := float64(err[layerIdx][y][col])
-		if isReplay {
-			v *= 1.1
-		}
-		dy[y] = v
-	}
-
-	// === 1) Recompute forward intermediates from prev (needed for grads) ===
-
-	// Tokens X (length N): scalar per prev cell
-	X := make([]float64, N)
-	idx := 0
-	for y := 0; y < prev.Height; y++ {
-		for x := 0; x < prev.Width; x++ {
-			X[idx] = f64(prev.Neurons[y][x].Value)
-			idx++
-		}
-	}
-	if cfg.PosEnc2D {
-		addTinyPosEnc2D(X, prev)
-	}
-
-	// Projections: Q,K,V in [N][dk]
+	// 2) Q,K,V
 	Q := make([][]float64, N)
 	K := make([][]float64, N)
 	V := make([][]float64, N)
@@ -340,7 +216,7 @@ func (n *Network[T]) backwardAttnColumn(
 		Q[i], K[i], V[i] = q, k, v
 	}
 
-	// Scores S = softmax((QKᵀ)/√dk)  → A
+	// 3) Attention
 	scale := 1.0 / math.Sqrt(float64(dk))
 	A := make([][]float64, N)
 	for i := 0; i < N; i++ {
@@ -352,7 +228,7 @@ func (n *Network[T]) backwardAttnColumn(
 	}
 	softmaxRowsInPlace(A)
 
-	// Z = A V  (N×N @ N×dk => N×dk)
+	// 4) Z = A V
 	Z := make([][]float64, N)
 	for i := 0; i < N; i++ {
 		zi := make([]float64, dk)
@@ -369,7 +245,7 @@ func (n *Network[T]) backwardAttnColumn(
 		Z[i] = zi
 	}
 
-	// zbar = mean_i Z[i]
+	// 5) Pool
 	zbar := make([]float64, dk)
 	for i := 0; i < N; i++ {
 		zi := Z[i]
@@ -382,20 +258,214 @@ func (n *Network[T]) backwardAttnColumn(
 		zbar[t] *= invN
 	}
 
-	// === 2) Backprop from y = f(zbar) ===
-	// dZ, dA, dV, dQ, dK, dX, and param grads
-	dZ := make([][]float64, N) // same shape as Z
-	for i := 0; i < N; i++ {   // init
+	// Optional norm
+	if cfg.UseNorm {
+		eps := defNormEps(cfg)
+		mu := 0.0
+		for t := 0; t < dk; t++ {
+			mu += zbar[t]
+		}
+		mu /= float64(dk)
+		vv := 0.0
+		for t := 0; t < dk; t++ {
+			d := zbar[t] - mu
+			vv += d * d
+		}
+		vv /= float64(dk)
+		invStd := 1.0 / math.Sqrt(vv+eps)
+		for t := 0; t < dk; t++ {
+			zbar[t] = (zbar[t] - mu) * invStd
+		}
+	}
+
+	// 6) Project
+	out := make([]float64, curr.Height)
+	if cfg.UseWo && len(params.Wo) == dk*curr.Height {
+		for y := 0; y < curr.Height; y++ {
+			sum := 0.0
+			base := y * dk
+			for t := 0; t < dk; t++ {
+				sum += zbar[t] * f64(params.Wo[base+t])
+			}
+			out[y] = sum
+		}
+	} else {
+		sum := 0.0
+		for t := 0; t < dk; t++ {
+			sum += zbar[t]
+		}
+		for y := 0; y < curr.Height; y++ {
+			alpha := float64(y) / float64(max(1, curr.Height-1))
+			out[y] = (1.0-alpha)*sum + 0.5*alpha*sum
+		}
+	}
+
+	// 7) Activation (+ optional replay gain)
+	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
+	replayGain := defReplayGain(cfg)
+	for y := 0; y < curr.Height; y++ {
+		val := tOf[T](out[y])
+		val = ApplyActivationGeneric(val, curr.Neurons[y][col].Activation)
+		if useReplay {
+			val = tOf[T](float64(val) * replayGain)
+		}
+		curr.Neurons[y][col].Value = val
+	}
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Backward
+   ───────────────────────────────────────────────────────────────────────────── */
+
+func (n *Network[T]) backwardAttnColumn(
+	layerIdx int,
+	col int,
+	err [][][]T,
+	lr float64,
+	clipUpper T,
+	clipLower T,
+	isReplay bool,
+) {
+	curr := &n.Layers[layerIdx]
+	prev := &n.Layers[layerIdx-1]
+	cfg := curr.Attn
+	if cfg == nil || cfg.DK <= 0 {
+		return
+	}
+
+	params := ensureAttnParams[T](curr, prev, col)
+	if params == nil {
+		return
+	}
+
+	N := prev.Width * prev.Height
+	dk := params.DK
+	if N == 0 || dk == 0 {
+		return
+	}
+
+	// upstream grad
+	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
+	replayGain := defReplayGain(cfg)
+
+	dy := make([]float64, curr.Height)
+	for y := 0; y < curr.Height; y++ {
+		v := float64(err[layerIdx][y][col])
+		if useReplay {
+			v *= replayGain
+		}
+		dy[y] = v
+	}
+
+	// Recompute intermediates (same as forward)
+	X := make([]float64, N)
+	idx := 0
+	for y := 0; y < prev.Height; y++ {
+		for x := 0; x < prev.Width; x++ {
+			X[idx] = f64(prev.Neurons[y][x].Value)
+			idx++
+		}
+	}
+	if cfg.PosEnc2D {
+		addTinyPosEnc2DWithAmp(X, prev, defPosEncAmp(cfg))
+	}
+
+	Q := make([][]float64, N)
+	K := make([][]float64, N)
+	V := make([][]float64, N)
+	for i := 0; i < N; i++ {
+		q := make([]float64, dk)
+		k := make([]float64, dk)
+		v := make([]float64, dk)
+		x := X[i]
+		for t := 0; t < dk; t++ {
+			q[t] = x * f64(params.Wq[t])
+			k[t] = x * f64(params.Wk[t])
+			v[t] = x * f64(params.Wv[t])
+		}
+		Q[i], K[i], V[i] = q, k, v
+	}
+
+	scale := 1.0 / math.Sqrt(float64(dk))
+	A := make([][]float64, N)
+	for i := 0; i < N; i++ {
+		row := make([]float64, N)
+		for j := 0; j < N; j++ {
+			row[j] = scale * dot(Q[i], K[j])
+		}
+		A[i] = row
+	}
+	softmaxRowsInPlace(A)
+
+	Z := make([][]float64, N)
+	for i := 0; i < N; i++ {
+		zi := make([]float64, dk)
+		for j := 0; j < N; j++ {
+			a := A[i][j]
+			if a == 0 {
+				continue
+			}
+			vj := V[j]
+			for t := 0; t < dk; t++ {
+				zi[t] += a * vj[t]
+			}
+		}
+		Z[i] = zi
+	}
+
+	zbar := make([]float64, dk)
+	for i := 0; i < N; i++ {
+		zi := Z[i]
+		for t := 0; t < dk; t++ {
+			zbar[t] += zi[t]
+		}
+	}
+	invN := 1.0 / float64(N)
+	for t := 0; t < dk; t++ {
+		zbar[t] *= invN
+	}
+
+	// optional norm (cache stats)
+	useNorm := cfg.UseNorm
+	eps := defNormEps(cfg)
+
+	var mu, invStd float64
+	var yhat []float64
+	if useNorm {
+		mu = 0.0
+		for t := 0; t < dk; t++ {
+			mu += zbar[t]
+		}
+		mu /= float64(dk)
+		vv := 0.0
+		for t := 0; t < dk; t++ {
+			d := zbar[t] - mu
+			vv += d * d
+		}
+		vv /= float64(dk)
+		invStd = 1.0 / math.Sqrt(vv+eps)
+		yhat = make([]float64, dk)
+		for t := 0; t < dk; t++ {
+			yhat[t] = (zbar[t] - mu) * invStd
+		}
+	}
+
+	// grads
+	dZ := make([][]float64, N)
+	for i := 0; i < N; i++ {
 		dZ[i] = make([]float64, dk)
 	}
+
 	dA := make([][]float64, N)
 	for i := 0; i < N; i++ {
 		dA[i] = make([]float64, N)
 	}
+
 	dV := make([][]float64, N)
 	for j := 0; j < N; j++ {
 		dV[j] = make([]float64, dk)
 	}
+
 	dQ := make([][]float64, N)
 	dK := make([][]float64, N)
 	for i := 0; i < N; i++ {
@@ -404,7 +474,6 @@ func (n *Network[T]) backwardAttnColumn(
 	}
 	dX := make([]float64, N)
 
-	// Param grads
 	gWq := make([]float64, dk)
 	gWk := make([]float64, dk)
 	gWv := make([]float64, dk)
@@ -413,10 +482,9 @@ func (n *Network[T]) backwardAttnColumn(
 		gWo = make([]float64, dk*curr.Height)
 	}
 
-	// (a) If UseWo: y = zbar·Wo  → dWo, dZbar
+	// back from projection
 	dZbar := make([]float64, dk)
 	if cfg.UseWo && gWo != nil {
-		// dWo += zbar ⊗ dy  (dk x Hcurr)
 		for y := 0; y < curr.Height; y++ {
 			base := y * dk
 			gy := dy[y]
@@ -426,29 +494,41 @@ func (n *Network[T]) backwardAttnColumn(
 			}
 		}
 	} else {
-		// Fallback path used in forward:
-		// out[y] = sum(zbar) * (1 - 0.5*alpha_y),  alpha_y = y/(H-1)
 		sumScale := 0.0
 		den := float64(max(1, curr.Height-1))
 		for y := 0; y < curr.Height; y++ {
 			alpha := float64(y) / den
 			sumScale += dy[y] * (1.0 - 0.5*alpha)
 		}
-		// d/d zbar[t] of sum(zbar) is 1, so each channel gets same dZbar
 		for t := 0; t < dk; t++ {
 			dZbar[t] += sumScale
 		}
 	}
 
-	// zbar = mean_i Z[i] → dZ[i] += dZbar / N
+	// back through norm (if used)
+	if useNorm {
+		g := dZbar
+		meanG := 0.0
+		meanGY := 0.0
+		for t := 0; t < dk; t++ {
+			meanG += g[t]
+			meanGY += g[t] * yhat[t]
+		}
+		meanG /= float64(dk)
+		meanGY /= float64(dk)
+		for t := 0; t < dk; t++ {
+			dZbar[t] = (g[t] - meanG - yhat[t]*meanGY) * invStd
+		}
+	}
+
+	// zbar = mean_i Z[i]
 	for i := 0; i < N; i++ {
 		for t := 0; t < dk; t++ {
 			dZ[i][t] += dZbar[t] * invN
 		}
 	}
 
-	// (b) Back through Z = A V
-	// dV += Aᵀ dZ; dA += dZ Vᵀ
+	// Z = A V
 	for i := 0; i < N; i++ {
 		zi := dZ[i]
 		Ai := A[i]
@@ -457,17 +537,14 @@ func (n *Network[T]) backwardAttnColumn(
 			if aij == 0 {
 				continue
 			}
-			// dV[j] += aij * dZ[i]
 			for t := 0; t < dk; t++ {
 				dV[j][t] += aij * zi[t]
 			}
-			// dA[i][j] += dZ[i]·V[j]
 			dA[i][j] += dot(zi, V[j])
 		}
 	}
 
-	// (c) Back through A = softmax(S) row-wise
-	// For each row i: dS_i = (dA_i - sum(dA_i * A_i)) ⊙ A_i
+	// A = softmax(S) row-wise
 	dS := make([][]float64, N)
 	for i := 0; i < N; i++ {
 		row := make([]float64, N)
@@ -481,40 +558,34 @@ func (n *Network[T]) backwardAttnColumn(
 		dS[i] = row
 	}
 
-	// (d) Back through S = (Q Kᵀ)/√dk
+	// S = (Q Kᵀ)/√dk
 	for i := 0; i < N; i++ {
 		for j := 0; j < N; j++ {
-			g := dS[i][j] * scale
+			g := dS[i][j] * (1.0 / math.Sqrt(float64(dk)))
 			if g == 0 {
 				continue
 			}
-			// dQ[i] += g * K[j]
 			for t := 0; t < dk; t++ {
 				dQ[i][t] += g * K[j][t]
-			}
-			// dK[j] += g * Q[i]
-			for t := 0; t < dk; t++ {
 				dK[j][t] += g * Q[i][t]
 			}
 		}
 	}
 
-	// (e) Back through projections: Q = X·Wq ; K = X·Wk ; V = X·Wv
-	// dW? += Xᵀ d?   and   dX += d? · W?ᵀ
+	// back to params & X
 	for i := 0; i < N; i++ {
 		x := X[i]
 		for t := 0; t < dk; t++ {
 			gWq[t] += x * dQ[i][t]
 			gWk[t] += x * dK[i][t]
 			gWv[t] += x * dV[i][t]
-			// dX accumulates from all three
 			dX[i] += dQ[i][t]*f64(params.Wq[t]) +
 				dK[i][t]*f64(params.Wk[t]) +
 				dV[i][t]*f64(params.Wv[t])
 		}
 	}
 
-	// === 3) Apply clipping and SGD updates to params ===
+	// clip + SGD
 	clip := func(g float64) float64 {
 		up := float64(clipUpper)
 		lo := float64(clipLower)
@@ -526,7 +597,6 @@ func (n *Network[T]) backwardAttnColumn(
 		}
 		return g
 	}
-
 	for t := 0; t < dk; t++ {
 		params.Wq[t] += T(lr * clip(gWq[t]))
 		params.Wk[t] += T(lr * clip(gWk[t]))
@@ -538,8 +608,7 @@ func (n *Network[T]) backwardAttnColumn(
 		}
 	}
 
-	// === 4) Scatter dX back to previous layer error tensor ===
-	// err[layerIdx-1][srcY][srcX] += dX[i]
+	// scatter to prev err
 	iTok := 0
 	for y := 0; y < prev.Height; y++ {
 		for x := 0; x < prev.Width; x++ {

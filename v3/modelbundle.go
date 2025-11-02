@@ -55,6 +55,14 @@ type AttnCfgWire struct {
 	Share    string  `json:"share"`    // "layer" | "per-slice"
 	Dropout  float32 `json:"dropout"`  // training only
 	PosEnc2D bool    `json:"posEnc2D"` // spatial awareness
+
+	// NEW (v2): keep these omitempty for back-compat with v1 bundles
+	UseNorm     bool    `json:"useNorm,omitempty"`
+	PosEncAmp   float64 `json:"posEncAmp,omitempty"`
+	NormEps     float64 `json:"normEps,omitempty"`
+	UseReplay   bool    `json:"useReplay,omitempty"`
+	ForceReplay bool    `json:"forceReplay,omitempty"`
+	ReplayGain  float64 `json:"replayGain,omitempty"`
 }
 
 // Learned attention parameter payload
@@ -95,7 +103,7 @@ func ExportBundleJSON[T Numeric](id string, n *Network[T], seed *int64) (string,
 	}
 	bun := Bundle{
 		Type:    "modelhost/bundle",
-		Version: 1,
+		Version: 2, // bumped
 		Models:  []BundleModel{m},
 	}
 	out, err := json.Marshal(bun)
@@ -118,7 +126,18 @@ func ImportBundleJSON(bundleJSON string) (any, error) {
 		return nil, errors.New("bundle: no models")
 	}
 	// For now, return first model. (You can extend to select by ID.)
-	return UnpackModel(bun.Models[0])
+	nAny, err := UnpackModel(bun.Models[0])
+	if err != nil {
+		return nil, err
+	}
+	// Back-compat defaults for v1 (or sloppy emitters)
+	switch n := nAny.(type) {
+	case *Network[float32]:
+		fillAttnDefaults(n)
+	case *Network[float64]:
+		fillAttnDefaults(n)
+	}
+	return nAny, nil
 }
 
 /* =============================================================================
@@ -217,11 +236,17 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 		// Attention knobs + PARAMS (persist)
 		if g.Attn != nil {
 			lc.Attn = &AttnCfgWire{
-				DK:       g.Attn.DK,
-				UseWo:    g.Attn.UseWo,
-				Share:    g.Attn.Share,
-				Dropout:  g.Attn.Dropout,
-				PosEnc2D: g.Attn.PosEnc2D,
+				DK:          g.Attn.DK,
+				UseWo:       g.Attn.UseWo,
+				Share:       g.Attn.Share,
+				Dropout:     g.Attn.Dropout,
+				PosEnc2D:    g.Attn.PosEnc2D,
+				UseNorm:     g.Attn.UseNorm,
+				PosEncAmp:   g.Attn.PosEncAmp,
+				NormEps:     g.Attn.NormEps,
+				UseReplay:   g.Attn.UseReplay,
+				ForceReplay: g.Attn.ForceReplay,
+				ReplayGain:  g.Attn.ReplayGain,
 			}
 			switch g.Attn.Share {
 			case "layer":
@@ -252,7 +277,7 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 				}
 			}
 		}
-		// Replay (optional)
+		// Replay (optional legacy block separate to Attn.UseReplay fields)
 		if g.ReplayEnabled || g.ReplayOffset != 0 || g.ReplayPhase != "" || g.MaxReplay != 0 || g.ReplayBudget != 0 {
 			lc.Replay = &ReplayCfg{
 				Enabled: g.ReplayEnabled,
@@ -298,14 +323,33 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 		// Attention knobs + PARAMS
 		if cl.Attn != nil {
 			gl.Attn = &AttnConfig[T]{
-				DK:       cl.Attn.DK,
-				UseWo:    cl.Attn.UseWo,
-				Share:    cl.Attn.Share,
-				Dropout:  cl.Attn.Dropout,
-				PosEnc2D: cl.Attn.PosEnc2D,
+				DK:          cl.Attn.DK,
+				UseWo:       cl.Attn.UseWo,
+				Share:       cl.Attn.Share,
+				Dropout:     cl.Attn.Dropout,
+				PosEnc2D:    cl.Attn.PosEnc2D,
+				UseNorm:     cl.Attn.UseNorm,
+				PosEncAmp:   cl.Attn.PosEncAmp,
+				NormEps:     cl.Attn.NormEps,
+				UseReplay:   cl.Attn.UseReplay,
+				ForceReplay: cl.Attn.ForceReplay,
+				ReplayGain:  cl.Attn.ReplayGain,
+			}
+			// Back-compat defaults for v1 bundles or zeroed fields
+			if gl.Attn.PosEncAmp == 0 {
+				gl.Attn.PosEncAmp = 1e-2
+			}
+			if gl.Attn.NormEps == 0 {
+				gl.Attn.NormEps = 1e-6
+			}
+			if gl.Attn.ReplayGain == 0 {
+				gl.Attn.ReplayGain = 1.1
+			}
+			if gl.Attn.Share == "" {
+				gl.Attn.Share = "layer"
 			}
 
-			switch cl.Attn.Share {
+			switch gl.Attn.Share {
 			case "layer":
 				if cl.AttnParams != nil {
 					gl.attnLayer = &AttnParams[T]{
@@ -349,7 +393,7 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 			}
 		}
 
-		// Replay
+		// Replay (legacy block)
 		if cl.Replay != nil {
 			gl.ReplayEnabled = cl.Replay.Enabled
 			gl.ReplayOffset = cl.Replay.Offset
@@ -444,4 +488,29 @@ func ensureAttnMaterialized[T Numeric](n *Network[T]) {
 		inGrid[y] = make([]float64, n.Layers[n.InputLayer].Width)
 	}
 	n.Forward(inGrid)
+}
+
+/* =============================================================================
+   Back-compat: fill defaults when older bundles are loaded
+   ========================================================================== */
+
+func fillAttnDefaults[T Numeric](n *Network[T]) {
+	for i := range n.Layers {
+		g := &n.Layers[i]
+		if g.Attn == nil {
+			continue
+		}
+		if g.Attn.Share == "" {
+			g.Attn.Share = "layer"
+		}
+		if g.Attn.PosEncAmp == 0 {
+			g.Attn.PosEncAmp = 1e-2
+		}
+		if g.Attn.NormEps == 0 {
+			g.Attn.NormEps = 1e-6
+		}
+		if g.Attn.ReplayGain == 0 {
+			g.Attn.ReplayGain = 1.1
+		}
+	}
 }
