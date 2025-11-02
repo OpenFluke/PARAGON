@@ -23,6 +23,13 @@ type GPULayerCompute struct {
 	inputSize       uint32
 	outputSize      uint32
 	layerIndex      int
+
+	// For mixed layers with attention
+	hasMixed      bool
+	denseColumns  []int                         // Column indices that are dense
+	attnColumns   []int                         // Column indices that are attention
+	attnComputes  map[int]*GPUAttnColumnCompute // Per-attention-column compute
+	columnOutputs *wgpu.Buffer                  // Staging for per-column outputs
 }
 
 // GPUCompute manages optimized GPU neural network computation
@@ -79,11 +86,64 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		return nil, fmt.Errorf("invalid layer dimensions: input=%d, output=%d", inputSize, outputSize)
 	}
 
-	// Create shader for this specific layer
-	shaderCode := n.generateLayerShader(layerIdx, inputSize, outputSize)
+	// Check if this is a mixed layer
+	hasMixed := false
+	denseColumns := []int{}
+	attnColumns := []int{}
+
+	if currentLayer.Attn != nil && len(currentLayer.SliceTypes) > 0 {
+		for col, st := range currentLayer.SliceTypes {
+			if st == "attn" {
+				hasMixed = true
+				attnColumns = append(attnColumns, col)
+			} else {
+				denseColumns = append(denseColumns, col)
+			}
+		}
+	} else {
+		// All dense
+		for col := 0; col < currentLayer.Width; col++ {
+			denseColumns = append(denseColumns, col)
+		}
+	}
+
+	layerCompute := &GPULayerCompute{
+		inputSize:    inputSize,
+		outputSize:   outputSize,
+		layerIndex:   layerIdx,
+		hasMixed:     hasMixed,
+		denseColumns: denseColumns,
+		attnColumns:  attnColumns,
+	}
+
+	if hasMixed {
+		// Create attention column computes
+		layerCompute.attnComputes = make(map[int]*GPUAttnColumnCompute)
+		for _, col := range attnColumns {
+			attnComp, err := n.createAttnColumnCompute(layerIdx, col)
+			if err != nil {
+				layerCompute.cleanup()
+				return nil, fmt.Errorf("failed to create attention compute for col %d: %v", col, err)
+			}
+			layerCompute.attnComputes[col] = attnComp
+		}
+	}
+
+	// Create shader for dense portion (or entire layer if no attention)
+	var shaderCode string
+	if len(denseColumns) > 0 {
+		shaderCode = n.generateDenseLayerShader(layerIdx, inputSize, outputSize)
+	} else {
+		// No dense columns - use a trivial shader
+		shaderCode = `
+@compute @workgroup_size(1)
+fn main() {}
+`
+	}
 
 	// Check ctx.device before use
 	if ctx.device == nil {
+		layerCompute.cleanup()
 		return nil, fmt.Errorf("WebGPU device not initialized for layer %d", layerIdx)
 	}
 
@@ -93,6 +153,7 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		WGSLDescriptor: &wgpu.ShaderModuleWGSLDescriptor{Code: shaderCode},
 	})
 	if err != nil {
+		layerCompute.cleanup()
 		return nil, fmt.Errorf("failed to create shader module: %v", err)
 	}
 	defer module.Release() // Clean up after pipeline creation
@@ -136,8 +197,11 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		},
 	})
 	if err != nil {
+		layerCompute.cleanup()
 		return nil, fmt.Errorf("failed to create bind group layout: %v", err)
 	}
+
+	layerCompute.bindGroupLayout = bindGroupLayout
 
 	// Create pipeline layout
 	pipelineLayout, err := ctx.device.CreatePipelineLayout(&wgpu.PipelineLayoutDescriptor{
@@ -145,7 +209,7 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		BindGroupLayouts: []*wgpu.BindGroupLayout{bindGroupLayout},
 	})
 	if err != nil {
-		bindGroupLayout.Release()
+		layerCompute.cleanup()
 		return nil, fmt.Errorf("failed to create pipeline layout: %v", err)
 	}
 	defer pipelineLayout.Release() // Clean up after pipeline creation
@@ -160,19 +224,13 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		},
 	})
 	if err != nil {
-		bindGroupLayout.Release()
+		layerCompute.cleanup()
 		return nil, fmt.Errorf("failed to create compute pipeline: %v", err)
 	}
 
-	// Create buffers
-	layerCompute := &GPULayerCompute{
-		pipeline:        pipeline,
-		bindGroupLayout: bindGroupLayout,
-		inputSize:       inputSize,
-		outputSize:      outputSize,
-		layerIndex:      layerIdx,
-	}
+	layerCompute.pipeline = pipeline
 
+	// Create buffers
 	// Input buffer
 	layerCompute.inputBuffer, err = ctx.device.CreateBuffer(&wgpu.BufferDescriptor{
 		Label: fmt.Sprintf("Layer_%d_Input", layerIdx),
@@ -206,7 +264,7 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 		return nil, fmt.Errorf("failed to create staging buffer: %v", err)
 	}
 
-	// Prepare weight and bias data
+	// Prepare weight and bias data (for dense columns only)
 	weights, biases := n.extractLayerWeightsAndBiases(layerIdx)
 
 	// Weight buffer
@@ -252,9 +310,9 @@ func (n *Network[T]) createLayerCompute(layerIdx int) (*GPULayerCompute, error) 
 	layerCompute.workgroupsY = 1
 
 	if n.Debug {
-		fmt.Printf("Created layer %d compute: %dx%d -> %dx%d, workgroups: %d\n",
+		fmt.Printf("Created layer %d compute: %dx%d -> %dx%d, dense cols: %v, attn cols: %v, workgroups: %d\n",
 			layerIdx, prevLayer.Width, prevLayer.Height,
-			currentLayer.Width, currentLayer.Height, layerCompute.workgroupsX)
+			currentLayer.Width, currentLayer.Height, denseColumns, attnColumns, layerCompute.workgroupsX)
 	}
 
 	return layerCompute, nil
@@ -277,6 +335,9 @@ func (lc *GPULayerCompute) cleanup() {
 	if lc.stagingBuffer != nil {
 		lc.stagingBuffer.Destroy()
 	}
+	if lc.columnOutputs != nil {
+		lc.columnOutputs.Destroy()
+	}
 	if lc.bindGroup != nil {
 		lc.bindGroup.Release()
 	}
@@ -286,13 +347,49 @@ func (lc *GPULayerCompute) cleanup() {
 	if lc.pipeline != nil {
 		lc.pipeline.Release()
 	}
+	// Clean up attention computes
+	if lc.attnComputes != nil {
+		for _, ac := range lc.attnComputes {
+			ac.cleanup()
+		}
+	}
 }
 
 // Generate optimized shader for a specific layer
 func (n *Network[T]) generateLayerShader(layerIdx int, inputSize, outputSize uint32) string {
+	curr := n.Layers[layerIdx]
+
+	// Check if this layer has any attention columns
+	hasAttn := false
+	if curr.Attn != nil && len(curr.SliceTypes) > 0 {
+		for _, st := range curr.SliceTypes {
+			if st == "attn" {
+				hasAttn = true
+				break
+			}
+		}
+	}
+
+	if !hasAttn {
+		// Pure dense layer
+		return n.generateDenseLayerShader(layerIdx, inputSize, outputSize)
+	}
+
+	// Mixed layer with attention
+	return n.generateMixedLayerShader(layerIdx, inputSize, outputSize)
+}
+
+// Generate shader for pure dense layer
+func (n *Network[T]) generateDenseLayerShader(layerIdx int, inputSize, outputSize uint32) string {
 	currentLayer := n.Layers[layerIdx]
 	activation := currentLayer.Neurons[0][0].Activation
 	typ := n.gpu.wgslType
+	if typ == "" {
+		typ = getWGSLType[T]()
+		if typ == "" {
+			typ = "f32" // final fallback
+		}
+	}
 	activationCode := getActivationCode(activation, typ)
 
 	return fmt.Sprintf(`
@@ -320,6 +417,232 @@ func (n *Network[T]) generateLayerShader(layerIdx int, inputSize, outputSize uin
 			output[output_idx] = activate(sum);
 		}
 	`, typ, typ, typ, typ, activationCode, outputSize, typ, inputSize, inputSize)
+}
+
+// Generate shader for mixed dense+attention layer
+func (n *Network[T]) generateMixedLayerShader(layerIdx int, inputSize, outputSize uint32) string {
+	curr := n.Layers[layerIdx]
+	prev := n.Layers[layerIdx-1]
+	cfg := curr.Attn
+
+	if cfg == nil {
+		return n.generateDenseLayerShader(layerIdx, inputSize, outputSize)
+	}
+
+	heads := cfg.Heads
+	if heads <= 0 {
+		heads = 1
+	}
+	dk := cfg.DK
+	hd := heads * dk
+	prevW := prev.Width
+	prevH := prev.Height
+	N := prevW * prevH
+
+	posEncAmp := cfg.PosEncAmp
+	if posEncAmp == 0 {
+		posEncAmp = 0.02
+	}
+	normEps := cfg.NormEps
+	if normEps == 0 {
+		normEps = 1e-6
+	}
+
+	activation := curr.Neurons[0][0].Activation
+	typ := n.gpu.wgslType
+	activationCode := getActivationCode(activation, typ)
+
+	// Build shader that handles column types
+	shader := fmt.Sprintf(`
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read> biases: array<f32>;
+
+%s
+
+const PREV_W: u32 = %du;
+const PREV_H: u32 = %du;
+const N: u32 = %du;
+const HEADS: u32 = %du;
+const DK: u32 = %du;
+const HD: u32 = %du;
+const CURR_H: u32 = %du;
+const POS_ENC_AMP: f32 = %f;
+const NORM_EPS: f32 = %f;
+const USE_NORM: u32 = %du;
+const USE_WO: u32 = %du;
+const CURR_W: u32 = %du;
+
+fn dot_product(a: ptr<function, array<f32, DK>>, b: ptr<function, array<f32, DK>>) -> f32 {
+    var sum = 0.0;
+    for (var t = 0u; t < DK; t++) {
+        sum += (*a)[t] * (*b)[t];
+    }
+    return sum;
+}
+
+fn softmax_row(row: ptr<function, array<f32, N>>) {
+    var mx = (*row)[0];
+    for (var j = 1u; j < N; j++) {
+        mx = max(mx, (*row)[j]);
+    }
+    var sum = 0.0;
+    for (var j = 0u; j < N; j++) {
+        let e = exp((*row)[j] - mx);
+        (*row)[j] = e;
+        sum += e;
+    }
+    if (sum > 0.0) {
+        let inv = 1.0 / sum;
+        for (var j = 0u; j < N; j++) {
+            (*row)[j] *= inv;
+        }
+    }
+}
+
+// Process attention column
+fn process_attn_column(col: u32, weight_offset: u32) -> f32 {
+    // 1) Build tokens with positional encoding
+    var X: array<f32, N>;
+    for (var i = 0u; i < N; i++) {
+        X[i] = input[i];
+    }
+    `, activationCode, prevW, prevH, N, heads, dk, hd, curr.Height, posEncAmp, normEps,
+		boolToU32(cfg.UseNorm), boolToU32(cfg.UseWo), curr.Width)
+
+	if cfg.PosEnc2D {
+		shader += `
+    // Add 2D positional encoding
+    for (var y = 0u; y < PREV_H; y++) {
+        for (var x = 0u; x < PREV_W; x++) {
+            let i = y * PREV_W + x;
+            let fy = f32(y) / f32(max(1u, PREV_H - 1u));
+            let fx = f32(x) / f32(max(1u, PREV_W - 1u));
+            X[i] += POS_ENC_AMP * (sin(6.283185 * fy) + cos(6.283185 * fx));
+        }
+    }
+`
+	}
+
+	shader += fmt.Sprintf(`
+    // 2) Multi-head attention
+    var zbar_cat: array<f32, HD>;
+    var head_offset = 0u;
+    
+    for (var h = 0u; h < HEADS; h++) {
+        // Q, K, V projections for this head
+        var Q: array<array<f32, DK>, N>;
+        var K: array<array<f32, DK>, N>;
+        var V: array<array<f32, DK>, N>;
+        
+        let wq_base = weight_offset + h * DK;
+        let wk_base = weight_offset + HEADS * DK + h * DK;
+        let wv_base = weight_offset + 2u * HEADS * DK + h * DK;
+        
+        for (var i = 0u; i < N; i++) {
+            let x = X[i];
+            for (var t = 0u; t < DK; t++) {
+                Q[i][t] = x * weights[wq_base + t];
+                K[i][t] = x * weights[wk_base + t];
+                V[i][t] = x * weights[wv_base + t];
+            }
+        }
+        
+        // Attention scores
+        let scale = 1.0 / sqrt(f32(DK));
+        var A: array<array<f32, N>, N>;
+        for (var i = 0u; i < N; i++) {
+            for (var j = 0u; j < N; j++) {
+                A[i][j] = scale * dot_product(&Q[i], &K[j]);
+            }
+            softmax_row(&A[i]);
+        }
+        
+        // Z = A * V and pool to zbar_h
+        var zbar_h: array<f32, DK>;
+        for (var i = 0u; i < N; i++) {
+            var zi: array<f32, DK>;
+            for (var j = 0u; j < N; j++) {
+                let a = A[i][j];
+                if (a != 0.0) {
+                    for (var t = 0u; t < DK; t++) {
+                        zi[t] += a * V[j][t];
+                    }
+                }
+            }
+            for (var t = 0u; t < DK; t++) {
+                zbar_h[t] += zi[t];
+            }
+        }
+        
+        let invN = 1.0 / f32(N);
+        for (var t = 0u; t < DK; t++) {
+            zbar_h[t] *= invN;
+            zbar_cat[head_offset + t] = zbar_h[t];
+        }
+        head_offset += DK;
+    }
+    
+    // 3) Optional normalization
+    if (USE_NORM == 1u) {
+        var mu = 0.0;
+        for (var t = 0u; t < HD; t++) {
+            mu += zbar_cat[t];
+        }
+        mu /= f32(HD);
+        
+        var vv = 0.0;
+        for (var t = 0u; t < HD; t++) {
+            let d = zbar_cat[t] - mu;
+            vv += d * d;
+        }
+        vv /= f32(HD);
+        let inv_std = 1.0 / sqrt(vv + NORM_EPS);
+        
+        for (var t = 0u; t < HD; t++) {
+            zbar_cat[t] = (zbar_cat[t] - mu) * inv_std;
+        }
+    }
+    
+    // 4) Return value for this output neuron (y)
+    // This function is called per output neuron, so we compute just one y value
+    return 0.0; // Placeholder - will be replaced below
+}
+
+// Process dense column
+fn process_dense_column(col: u32, y: u32, weight_offset: u32) -> f32 {
+    var sum = biases[y * CURR_W + col];
+    let w_base = weight_offset + y * N;
+    for (var i = 0u; i < N; i++) {
+        sum += input[i] * weights[w_base + i];
+    }
+    return sum;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let output_idx = global_id.x;
+    if (output_idx >= %du) { return; }
+    
+    let y = output_idx / CURR_W;
+    let col = output_idx %% CURR_W;
+    
+    // Determine column type and process
+    // Column types are encoded in weights buffer metadata
+    // For simplicity, we'll use a convention: first %d cols are according to SliceTypes
+    
+    var value = 0.0;
+    
+    // TODO: Need to encode column type in buffer or use separate shader per column
+    // For now, stub implementation
+    value = process_dense_column(col, y, 0u);
+    
+    output[output_idx] = activate(value);
+}
+`, outputSize, len(curr.SliceTypes))
+
+	return shader
 }
 
 // relu,sigmoid,tanh,leaky_relu,elu,linear
@@ -480,6 +803,16 @@ func (n *Network[T]) ForwardGPUOptimized(inputs [][]float64) error {
 		return fmt.Errorf("optimized GPU not initialized")
 	}
 
+	// Check if any layer has mixed columns - if so, fall back to CPU
+	// TODO: Implement proper per-column dense compute for mixed layers
+	for _, lc := range n.gpu.optimized.layers {
+		if lc.hasMixed {
+			// Fall back to CPU for networks with mixed layers
+			n.forwardCPU(inputs)
+			return nil
+		}
+	}
+
 	var inputData []T
 	inputData = make([]T, 0, len(inputs)*len(inputs[0]))
 	for _, row := range inputs {
@@ -494,20 +827,17 @@ func (n *Network[T]) ForwardGPUOptimized(inputs [][]float64) error {
 		return fmt.Errorf("failed to create command encoder: %v", err)
 	}
 
-	// Process each layer sequentially but with full GPU parallelization within each layer
+	// Process each layer sequentially
 	for i, layerCompute := range n.gpu.optimized.layers {
 		// Upload input data to GPU
 		ctx.queue.WriteBuffer(layerCompute.inputBuffer, 0, wgpu.ToBytes(inputData))
 
-		// Create compute pass for this layer
+		// Pure dense layer - process on GPU
 		computePass := encoder.BeginComputePass(&wgpu.ComputePassDescriptor{
 			Label: fmt.Sprintf("Layer_%d_Compute", i+1),
 		})
-
 		computePass.SetPipeline(layerCompute.pipeline)
 		computePass.SetBindGroup(0, layerCompute.bindGroup, nil)
-
-		// Dispatch with optimal workgroup size
 		computePass.DispatchWorkgroups(layerCompute.workgroupsX, layerCompute.workgroupsY, 1)
 		computePass.End()
 
