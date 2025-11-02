@@ -28,6 +28,8 @@ func (n *Network[T]) InitializeBackwardGPU() error {
 		return fmt.Errorf("forward GPU must be initialized first")
 	}
 
+	n.gpu.wgslType = getWGSLType[float32]()
+
 	// Create backward resources
 	n.gpu.optimized.backward = &GPUBackwardResources{}
 
