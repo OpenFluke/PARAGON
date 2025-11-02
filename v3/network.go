@@ -364,6 +364,21 @@ func (n *Network[T]) backwardLayer(
 
 	for y := 0; y < curr.Height; y++ {
 		for x := 0; x < curr.Width; x++ {
+
+			// ── NEW: branch by slice type (column kind)
+			kind := "dense"
+			if curr.SliceTypes != nil && x < len(curr.SliceTypes) && curr.SliceTypes[x] != "" {
+				kind = curr.SliceTypes[x]
+			}
+			if kind == "attn" {
+				// Process the WHOLE column once (on the first row), since attention
+				// gradients couple all y in this column.
+				if y == 0 {
+					n.backwardAttnColumn(l, x, err, lr, clipUpper, clipLower, isReplay)
+				}
+				continue // skip dense-style updates for attn columns
+			}
+
 			neuron := curr.Neurons[y][x]
 			localT := err[l][y][x]
 			localF := float64(localT)
