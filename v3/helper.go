@@ -62,13 +62,9 @@ type BuildOpts[T Numeric] struct {
 	Activations []string
 	FullyConn   []bool
 	// Optional extras per layer (len should match #layers, empty -> no change)
-	SliceTypes    [][]string       // per layer, per column
-	Attn          []*AttnConfig[T] // per layer
-	ReplayEnabled []bool           // optional replay flags
-	ReplayOffset  []int
-	ReplayPhase   []string // "before"/"after"
-	ReplayMax     []int
-	ReplayBudget  []int
+	SliceTypes [][]string       // per layer, per column
+	Attn       []*AttnConfig[T] // per layer
+
 }
 
 func BuildGridNet[T Numeric](opts BuildOpts[T]) (*Network[T], error) {
@@ -98,22 +94,7 @@ func BuildGridNet[T Numeric](opts BuildOpts[T]) (*Network[T], error) {
 			a := *opts.Attn[i]
 			n.Layers[i].Attn = &a
 		}
-		// replay (optional)
-		if i < len(opts.ReplayEnabled) {
-			n.Layers[i].ReplayEnabled = opts.ReplayEnabled[i]
-		}
-		if i < len(opts.ReplayOffset) {
-			n.Layers[i].ReplayOffset = opts.ReplayOffset[i]
-		}
-		if i < len(opts.ReplayPhase) && opts.ReplayPhase[i] != "" {
-			n.Layers[i].ReplayPhase = opts.ReplayPhase[i]
-		}
-		if i < len(opts.ReplayMax) {
-			n.Layers[i].MaxReplay = opts.ReplayMax[i]
-		}
-		if i < len(opts.ReplayBudget) {
-			n.Layers[i].ReplayBudget = opts.ReplayBudget[i]
-		}
+
 	}
 	return n, nil
 }

@@ -255,18 +255,15 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 		if g.Attn != nil {
 			heads := defHeads(g.Attn)
 			lc.Attn = &AttnCfgWire{
-				Heads:       heads,
-				DK:          g.Attn.DK,
-				UseWo:       g.Attn.UseWo,
-				Share:       g.Attn.Share,
-				Dropout:     g.Attn.Dropout,
-				PosEnc2D:    g.Attn.PosEnc2D,
-				UseNorm:     g.Attn.UseNorm,
-				PosEncAmp:   g.Attn.PosEncAmp,
-				NormEps:     g.Attn.NormEps,
-				UseReplay:   g.Attn.UseReplay,
-				ForceReplay: g.Attn.ForceReplay,
-				ReplayGain:  g.Attn.ReplayGain,
+				Heads:     heads,
+				DK:        g.Attn.DK,
+				UseWo:     g.Attn.UseWo,
+				Share:     g.Attn.Share,
+				Dropout:   g.Attn.Dropout,
+				PosEnc2D:  g.Attn.PosEnc2D,
+				UseNorm:   g.Attn.UseNorm,
+				PosEncAmp: g.Attn.PosEncAmp,
+				NormEps:   g.Attn.NormEps,
 			}
 			switch g.Attn.Share {
 			case "layer":
@@ -303,16 +300,6 @@ func modelCfgFromNetwork[T Numeric](id string, n *Network[T], seed *int64) Model
 						}
 					}
 				}
-			}
-		}
-		// Replay (optional legacy block separate to Attn.UseReplay fields)
-		if g.ReplayEnabled || g.ReplayOffset != 0 || g.ReplayPhase != "" || g.MaxReplay != 0 || g.ReplayBudget != 0 {
-			lc.Replay = &ReplayCfg{
-				Enabled: g.ReplayEnabled,
-				Offset:  g.ReplayOffset,
-				Phase:   g.ReplayPhase,
-				Max:     g.MaxReplay,
-				Budget:  g.ReplayBudget,
 			}
 		}
 
@@ -362,9 +349,6 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 			gl.Attn.UseNorm = cl.Attn.UseNorm
 			gl.Attn.PosEncAmp = cl.Attn.PosEncAmp
 			gl.Attn.NormEps = cl.Attn.NormEps
-			gl.Attn.UseReplay = cl.Attn.UseReplay
-			gl.Attn.ForceReplay = cl.Attn.ForceReplay
-			gl.Attn.ReplayGain = cl.Attn.ReplayGain
 
 			// Back-compat defaults for older bundles or zeroed fields
 			if gl.Attn.Heads <= 0 {
@@ -376,9 +360,7 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 			if gl.Attn.NormEps == 0 {
 				gl.Attn.NormEps = 1e-6
 			}
-			if gl.Attn.ReplayGain == 0 {
-				gl.Attn.ReplayGain = 1.1
-			}
+
 			if gl.Attn.Share == "" {
 				gl.Attn.Share = "layer"
 			}
@@ -415,14 +397,6 @@ func applyCfgToNetwork[T Numeric](n *Network[T], cfg ModelCfg) error {
 			}
 		}
 
-		// Replay (legacy block)
-		if cl.Replay != nil {
-			gl.ReplayEnabled = cl.Replay.Enabled
-			gl.ReplayOffset = cl.Replay.Offset
-			gl.ReplayPhase = cl.Replay.Phase
-			gl.MaxReplay = cl.Replay.Max
-			gl.ReplayBudget = cl.Replay.Budget
-		}
 	}
 	return nil
 }
@@ -583,9 +557,6 @@ func fillAttnDefaults[T Numeric](n *Network[T]) {
 		}
 		if g.Attn.NormEps == 0 {
 			g.Attn.NormEps = 1e-6
-		}
-		if g.Attn.ReplayGain == 0 {
-			g.Attn.ReplayGain = 1.1
 		}
 	}
 }

@@ -24,10 +24,6 @@ type AttnConfig[T Numeric] struct {
 	PosEncAmp float64 // default 1e-2
 	NormEps   float64 // default 1e-6
 
-	// Replay controls (optional):
-	UseReplay   bool    // enable replay gain path
-	ForceReplay bool    // force replay gain even if caller isn't in replay
-	ReplayGain  float64 // default 1.1 (only used if UseReplay)
 }
 
 type AttnParams[T Numeric] struct {
@@ -69,13 +65,6 @@ func defNormEps[T Numeric](cfg *AttnConfig[T]) float64 {
 		return 1e-6
 	}
 	return cfg.NormEps
-}
-
-func defReplayGain[T Numeric](cfg *AttnConfig[T]) float64 {
-	if cfg == nil || cfg.ReplayGain == 0 {
-		return 1.1
-	}
-	return cfg.ReplayGain
 }
 
 func defHeads[T Numeric](cfg *AttnConfig[T]) int {
@@ -334,14 +323,11 @@ func (n *Network[T]) forwardAttnColumn(layerIdx int, col int, isReplay bool) {
 	}
 
 	// 4) Activation (+ optional replay gain)
-	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
-	replayGain := defReplayGain(cfg)
+
 	for y := 0; y < curr.Height; y++ {
 		val := tOf[T](out[y])
 		val = ApplyActivationGeneric(val, curr.Neurons[y][col].Activation)
-		if useReplay {
-			val = tOf[T](float64(val) * replayGain)
-		}
+
 		curr.Neurons[y][col].Value = val
 	}
 }
@@ -379,16 +365,9 @@ func (n *Network[T]) backwardAttnColumn(
 	}
 	Hd := H * dk
 
-	// Upstream grad (+ replay gain if enabled)
-	useReplay := cfg.UseReplay && (isReplay || cfg.ForceReplay)
-	replayGain := defReplayGain(cfg)
-
 	dy := make([]float64, curr.Height)
 	for y := 0; y < curr.Height; y++ {
 		v := float64(err[layerIdx][y][col])
-		if useReplay {
-			v *= replayGain
-		}
 		dy[y] = v
 	}
 

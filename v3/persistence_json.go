@@ -53,14 +53,9 @@ func (n *Network[T]) ToS() sNet {
 
 	for li, L := range n.Layers {
 		sl := sLayer{
-			W:             L.Width,
-			H:             L.Height,
-			Neurons:       make([][]sNeuron, L.Height),
-			ReplayEnabled: L.ReplayEnabled,
-			ReplayOffset:  L.ReplayOffset,
-			ReplayPhase:   L.ReplayPhase,
-			MaxReplay:     L.MaxReplay,
-			ReplayBudget:  L.ReplayBudget,
+			W:       L.Width,
+			H:       L.Height,
+			Neurons: make([][]sNeuron, L.Height),
 		}
 
 		for y := 0; y < L.Height; y++ {
@@ -112,14 +107,9 @@ func (n *Network[T]) FromS(s sNet) error {
 		}
 
 		L := Grid[T]{
-			Width:         sl.W,
-			Height:        sl.H,
-			Neurons:       make([][]*Neuron[T], sl.H),
-			ReplayEnabled: sl.ReplayEnabled,
-			ReplayOffset:  sl.ReplayOffset,
-			ReplayPhase:   sl.ReplayPhase,
-			MaxReplay:     sl.MaxReplay,
-			ReplayBudget:  sl.ReplayBudget,
+			Width:   sl.W,
+			Height:  sl.H,
+			Neurons: make([][]*Neuron[T], sl.H),
 		}
 
 		for y := 0; y < sl.H; y++ {
