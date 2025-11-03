@@ -8,14 +8,35 @@ import (
 
 // In the Forward method in webgpu_optimized.go, ensure initialization:
 func (n *Network[T]) Forward(inputs [][]float64) {
-	// Initialize optimized GPU if not already done
+	// Use GPU if enabled
+	if n.WebGPUNative {
+		if err := n.forwardGPU(inputs); err != nil {
+			// Fall back to CPU on error
+			if n.Debug {
+				fmt.Printf("[GPU] Forward error, falling back to CPU: %v\n", err)
+			}
+			n.forwardCPU(inputs)
+		}
+		return
+	}
 
-	// Fallback to existing implementation
+	// Fallback to existing CPU implementation
 	n.forwardCPU(inputs)
 }
 
 // Backward method with GPU support
 func (n *Network[T]) Backward(targets [][]float64, lr float64, clipUpper, clipLower T) {
+	// Use GPU if enabled
+	if n.WebGPUNative {
+		if err := n.backwardGPU(targets, lr, clipUpper, clipLower); err != nil {
+			// Fall back to CPU on error
+			if n.Debug {
+				fmt.Printf("[GPU] Backward error, falling back to CPU: %v\n", err)
+			}
+			n.backwardCPU(targets, lr, clipUpper, clipLower)
+		}
+		return
+	}
 
 	n.backwardCPU(targets, lr, clipUpper, clipLower)
 }
